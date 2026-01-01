@@ -8,3 +8,4 @@ eval_outputs/
 logs/
 dpo_model/
 dynamic_dpo_model/
+.venv/
