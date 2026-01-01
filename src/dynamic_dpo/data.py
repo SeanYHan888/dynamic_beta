@@ -1,5 +1,5 @@
 import torch
-from datasets import load_dataset, Dataset
+from datasets import load_dataset
 from torch.utils.data import DataLoader
 from functools import partial
 
@@ -57,15 +57,29 @@ def convert_to_triples(chosen_text, rejected_text):
 
 # process entire dataset, build hh dataset
 def build_HH_dataset(ds):
-    hh_ds_raw = []
-    for idx, row in enumerate(ds):
-        output = convert_to_triples(
-            chosen_text = row['chosen'],
-            rejected_text = row['rejected']
-        )
-        if output is not None:
-            hh_ds_raw.append(output)
-    return Dataset.from_list(hh_ds_raw)
+    def map_fn(batch):
+        prompts, chosens, rejecteds, valids = [], [], [], []
+        for chosen_text, rejected_text in zip(batch["chosen"], batch["rejected"]):
+            output = convert_to_triples(
+                chosen_text=chosen_text,
+                rejected_text=rejected_text,
+            )
+            if output is None:
+                prompts.append("")
+                chosens.append("")
+                rejecteds.append("")
+                valids.append(False)
+            else:
+                prompts.append(output["prompt"])
+                chosens.append(output["chosen"])
+                rejecteds.append(output["rejected"])
+                valids.append(True)
+        return {"prompt": prompts, "chosen": chosens, "rejected": rejecteds, "is_valid": valids}
+
+    ds_triple = ds.map(map_fn, batched=True, remove_columns=ds.column_names)
+    ds_triple = ds_triple.filter(lambda x: x["is_valid"])
+    ds_triple = ds_triple.remove_columns(["is_valid"])
+    return ds_triple
 
 
 def collate_fn(batch, tokenizer, max_len):
@@ -127,10 +141,26 @@ def collate_fn(batch, tokenizer, max_len):
     bos_shift = 1 if has_bos else 0
     prompt_length = torch.tensor([pl + bos_shift for pl in prompt_lens], dtype=torch.long)
 
-    # Build labels: input_ids with prompt tokens masked to -100
-    chosen_labels = enc_chosen.input_ids.clone()
-    rejected_labels = enc_rejected.input_ids.clone()
+    max_seq_len = enc_chosen.input_ids.size(1)
+    keep_mask = prompt_length < max_seq_len
+    if not keep_mask.any():
+        return None
+    if not keep_mask.all():
+        keep_idx = keep_mask.nonzero(as_tuple=True)[0]
+        enc_chosen_input_ids = enc_chosen.input_ids[keep_idx]
+        enc_chosen_attention_mask = enc_chosen.attention_mask[keep_idx]
+        enc_rejected_input_ids = enc_rejected.input_ids[keep_idx]
+        enc_rejected_attention_mask = enc_rejected.attention_mask[keep_idx]
+        prompt_length = prompt_length[keep_idx]
+    else:
+        enc_chosen_input_ids = enc_chosen.input_ids
+        enc_chosen_attention_mask = enc_chosen.attention_mask
+        enc_rejected_input_ids = enc_rejected.input_ids
+        enc_rejected_attention_mask = enc_rejected.attention_mask
 
+    # Build labels: input_ids with prompt tokens masked to -100
+    chosen_labels = enc_chosen_input_ids.clone()
+    rejected_labels = enc_rejected_input_ids.clone()
     max_seq_len = chosen_labels.size(1)
     for i, pl in enumerate(prompt_length.tolist()):
         pl = min(pl, max_seq_len)
@@ -138,16 +168,16 @@ def collate_fn(batch, tokenizer, max_len):
         rejected_labels[i, :pl] = -100
 
     # mask padding
-    chosen_labels[enc_chosen.attention_mask == 0] = -100
-    rejected_labels[enc_rejected.attention_mask == 0] = -100
+    chosen_labels[enc_chosen_attention_mask == 0] = -100
+    rejected_labels[enc_rejected_attention_mask == 0] = -100
 
     return {
-        "chosen_input_ids": enc_chosen.input_ids,
-        "chosen_attention_mask": enc_chosen.attention_mask,
+        "chosen_input_ids": enc_chosen_input_ids,
+        "chosen_attention_mask": enc_chosen_attention_mask,
         "chosen_labels": chosen_labels,
 
-        "rejected_input_ids": enc_rejected.input_ids,
-        "rejected_attention_mask": enc_rejected.attention_mask,
+        "rejected_input_ids": enc_rejected_input_ids,
+        "rejected_attention_mask": enc_rejected_attention_mask,
         "rejected_labels": rejected_labels,
 
         # optional: useful for debugging / analysis

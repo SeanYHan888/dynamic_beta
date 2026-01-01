@@ -10,6 +10,7 @@ import wandb
 import os
 import json
 import logging
+from contextlib import nullcontext
 from typing import Dict, Any
 
 from .data import build_train_val
@@ -130,6 +131,7 @@ def train(config_path: str, mode: str = "dynamic"):
     optimizer = AdamW(params=policy.parameters(), lr=float(config['dpo_training']['learning_rate']))
 
     use_bf16 = config['precision'] == 'bf16'
+    use_amp = use_bf16 and device == "cuda"
     if use_bf16:
         policy.to(dtype=torch.bfloat16)
         ref_model.to(dtype=torch.bfloat16)
@@ -168,9 +170,9 @@ def train(config_path: str, mode: str = "dynamic"):
         risk_stat = {"total": 0, "fail": 0}
         log_f = open("risk_test_and_beta_log.jsonl", "w", encoding="utf-8")
         warmup_steps = int(config['dpo_training']['warmup_steps'])
-        warmup_done = False
+        warmup_done = warmup_steps <= 0
         warmup_count = 0
-        ema = None
+        ema = EMAUpdate(tau_0=0.0, q=q, momentum=momentum) if warmup_done else None
     else:
         # Static DPO
         # For static, we might still have warmup for LR, but not for beta
@@ -181,6 +183,11 @@ def train(config_path: str, mode: str = "dynamic"):
     global_steps = 0
     max_grad_norm = float(config['dpo_training']['max_grad_norm'])
 
+    margin_log_cfg = config.get('margin_log', {})
+    margin_log_every = int(margin_log_cfg.get('log_every', 1))
+    margin_log_sample_size = int(margin_log_cfg.get('sample_size', 0))
+    margin_log_save_npy = bool(margin_log_cfg.get('save_npy', True))
+
     for epoch in range(epochs):
         epoch_dir = os.path.join(LOG_DIR, f"epoch_{epoch:03d}")
         os.makedirs(epoch_dir, exist_ok=True)
@@ -190,9 +197,12 @@ def train(config_path: str, mode: str = "dynamic"):
         running_loss = 0.0
         
         for step, batch in pbar:
+            if batch is None:
+                continue
             batch = to_device_batch(batch, device)
 
-            with torch.cuda.amp.autocast(enabled=use_bf16, dtype=torch.bfloat16): 
+            amp_ctx = torch.cuda.amp.autocast(dtype=torch.bfloat16) if use_amp else nullcontext()
+            with amp_ctx:
                 policy_chosen_log_prob, policy_rejected_log_prob, ref_chosen_log_prob, ref_rejected_log_prob = compute_batch_log_prob(
                     batch, policy=policy, ref_model=ref_model
                 )
@@ -207,7 +217,7 @@ def train(config_path: str, mode: str = "dynamic"):
                     if not warmup_done:
                         threshold_accumulator.update(model_margin)
                         warmup_count += 1
-                        if warmup_count == warmup_steps:
+                        if warmup_count >= warmup_steps:
                             tau_0 = threshold_accumulator.finalize()
                             ema = EMAUpdate(tau_0=tau_0, q=q, momentum=momentum)
                             warmup_done = True
@@ -245,9 +255,16 @@ def train(config_path: str, mode: str = "dynamic"):
                         }) + "\n")
                         log_f.flush()
 
-                compute_and_log_model_margin(
-                    model_margin=model_margin, epoch_dir=epoch_dir, epoch=epoch, step=step, JSONL_PATH=JSONL_PATH
-                )
+                if margin_log_every > 0 and (global_steps % margin_log_every == 0):
+                    compute_and_log_model_margin(
+                        model_margin=model_margin,
+                        epoch_dir=epoch_dir,
+                        epoch=epoch,
+                        step=step,
+                        JSONL_PATH=JSONL_PATH,
+                        sample_size=margin_log_sample_size,
+                        save_npy=margin_log_save_npy,
+                    )
 
                 loss_raw, chosen_rewards, rejected_rewards = dpo_loss(
                     policy_chosen_log_prob, policy_rejected_log_prob, ref_chosen_log_prob, ref_rejected_log_prob, beta=beta_used

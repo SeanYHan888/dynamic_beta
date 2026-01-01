@@ -46,6 +46,9 @@ beta_update:
 margin_log:
   log_dir: logs/margins
   dpo_log_dir: logs/dpo_margins
+  log_every: 50
+  sample_size: 64
+  save_npy: true
 
 
 

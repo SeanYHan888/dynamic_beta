@@ -97,7 +97,7 @@ def dpo_loss(policy_chosen_log_prob, policy_rejected_log_prob, ref_chosen_log_pr
     return loss, chosen_rewards, rejected_rewards
 
 
-def compute_and_log_model_margin(model_margin, epoch_dir, epoch, step, JSONL_PATH):
+def compute_and_log_model_margin(model_margin, epoch_dir, epoch, step, JSONL_PATH, sample_size=0, save_npy=True):
     """
     Log model margins to a JSONL file and save raw margins as .npy.
     """
@@ -105,10 +105,11 @@ def compute_and_log_model_margin(model_margin, epoch_dir, epoch, step, JSONL_PAT
     # using numpy to process, so only on cpu
     m = model_margin.detach().float().cpu().numpy()  
                 
-    # 1) save full margins as .npy (raw, lossless)
-    # step: batch index
-    npy_path = os.path.join(epoch_dir, f"step_{step:05d}.npy")
-    np.save(npy_path, m)
+    npy_path = None
+    if save_npy:
+        # step: batch index
+        npy_path = os.path.join(epoch_dir, f"step_{step:05d}.npy")
+        np.save(npy_path, m)
 
     # 2) write a readable per-batch record to ONE jsonl file
     # summary stats
@@ -128,8 +129,10 @@ def compute_and_log_model_margin(model_margin, epoch_dir, epoch, step, JSONL_PAT
         "max": float(m.max()),
         "pos_frac": float((m > 0).mean()),
         "npy": npy_path,
-        "sample": [float(x) for x in m[:]],
     }
+    if sample_size > 0:
+        sample = m[: min(sample_size, m.shape[0])]
+        record["sample"] = [float(x) for x in sample]
 
     # save in the jsonl file       
     with open(JSONL_PATH, "a", encoding="utf-8") as f:
