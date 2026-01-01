@@ -1,6 +1,7 @@
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from functools import partial
 
 
@@ -143,20 +144,12 @@ def collate_fn(batch, tokenizer, max_len):
 
     max_seq_len = enc_chosen.input_ids.size(1)
     keep_mask = prompt_length < max_seq_len
-    if not keep_mask.any():
-        return None
     if not keep_mask.all():
-        keep_idx = keep_mask.nonzero(as_tuple=True)[0]
-        enc_chosen_input_ids = enc_chosen.input_ids[keep_idx]
-        enc_chosen_attention_mask = enc_chosen.attention_mask[keep_idx]
-        enc_rejected_input_ids = enc_rejected.input_ids[keep_idx]
-        enc_rejected_attention_mask = enc_rejected.attention_mask[keep_idx]
-        prompt_length = prompt_length[keep_idx]
-    else:
-        enc_chosen_input_ids = enc_chosen.input_ids
-        enc_chosen_attention_mask = enc_chosen.attention_mask
-        enc_rejected_input_ids = enc_rejected.input_ids
-        enc_rejected_attention_mask = enc_rejected.attention_mask
+        raise ValueError("Batch contains prompts that consume full sequence length. Filter dataset before collation.")
+    enc_chosen_input_ids = enc_chosen.input_ids
+    enc_chosen_attention_mask = enc_chosen.attention_mask
+    enc_rejected_input_ids = enc_rejected.input_ids
+    enc_rejected_attention_mask = enc_rejected.attention_mask
 
     # Build labels: input_ids with prompt tokens masked to -100
     chosen_labels = enc_chosen_input_ids.clone()
@@ -196,15 +189,53 @@ def build_train_val(config, tokenizer):
     ds = load_dataset(raw_dataset, split=split)
     ds_triple = build_HH_dataset(ds)
 
+    bos_shift = 1 if (getattr(tokenizer, "add_bos_token", False) and tokenizer.bos_token_id is not None) else 0
+
+    def add_prompt_len(batch):
+        lens = [
+            len(tokenizer(p, add_special_tokens=False)["input_ids"]) + bos_shift
+            for p in batch["prompt"]
+        ]
+        return {"prompt_len": lens}
+
+    ds_triple = ds_triple.map(add_prompt_len, batched=True)
+    ds_triple = ds_triple.filter(lambda x: x["prompt_len"] < max_len)
+    ds_triple = ds_triple.remove_columns(["prompt_len"])
+
     split_ds = ds_triple.train_test_split(test_size=val_ratio, seed=seed)
     train_ds_raw, val_ds_raw = split_ds["train"], split_ds["test"]
 
     ds_collate = partial(collate_fn, tokenizer=tokenizer, max_len=max_len)
 
+    distributed = config.get("distributed", {})
+    world_size = int(distributed.get("world_size", 1))
+    rank = int(distributed.get("rank", 0))
+    use_distributed = world_size > 1
+
+    train_sampler = None
+    val_sampler = None
+    if use_distributed:
+        train_sampler = DistributedSampler(
+            train_ds_raw,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=seed,
+        )
+        val_sampler = DistributedSampler(
+            val_ds_raw,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+            seed=seed,
+            drop_last=False,
+        )
+
     train_loader = DataLoader(
         train_ds_raw,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         collate_fn=ds_collate,
         pin_memory=True,
     )
@@ -212,11 +243,12 @@ def build_train_val(config, tokenizer):
         val_ds_raw,
         batch_size=batch_size,
         shuffle=False,
+        sampler=val_sampler,
         collate_fn=ds_collate,
         pin_memory=True,
     )
 
-    return train_loader, val_loader
+    return train_loader, val_loader, train_sampler, val_sampler
 
 
 

@@ -1,17 +1,26 @@
-import torch
-from torch.optim import AdamW
 import argparse
-import numpy as np
-import yaml
-from tqdm import tqdm
-import random
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import wandb
-import os
 import json
 import logging
-from contextlib import nullcontext
-from typing import Dict, Any
+import os
+import random
+from functools import partial
+from typing import Any, Dict
+
+import numpy as np
+import torch
+import wandb
+import yaml
+from accelerate import Accelerator
+try:
+    from accelerate.utils import FullyShardedDataParallelPlugin
+except ImportError:
+    from accelerate import FullyShardedDataParallelPlugin
+from torch.distributed.fsdp import FullStateDictConfig, MixedPrecision, ShardingStrategy, StateDictType
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.optim import AdamW
+from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from .data import build_train_val
 from .modeling import (
@@ -19,7 +28,6 @@ from .modeling import (
     margin_compute, 
     compute_and_log_model_margin, 
     compute_batch_log_prob,
-    empirical_over_threshold_proportion, 
     risk_test, 
     update_beta,
     WarmupQuantileAccumulator,
@@ -43,48 +51,108 @@ def seed_everything(seed: int = 42):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
+def resolve_fsdp_layer_classes(model, class_names):
+    layer_classes = set()
+    for class_name in class_names:
+        for module in model.modules():
+            if module.__class__.__name__ == class_name:
+                layer_classes.add(module.__class__)
+                break
+    return layer_classes
+
+def build_accelerator(config: Dict[str, Any], policy, mixed_precision: str) -> Accelerator:
+    fsdp_config = config.get("fsdp", {})
+    fsdp_enabled = bool(fsdp_config.get("enabled", False))
+    if not fsdp_enabled:
+        return Accelerator(mixed_precision=mixed_precision)
+    if not torch.cuda.is_available():
+        logger.warning("FSDP enabled but CUDA is not available. Disabling FSDP.")
+        return Accelerator(mixed_precision=mixed_precision)
+
+    auto_wrap_policy = None
+    layer_cls_names = fsdp_config.get("auto_wrap_layers", [])
+    if layer_cls_names:
+        layer_classes = resolve_fsdp_layer_classes(policy, layer_cls_names)
+        if layer_classes:
+            auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls=layer_classes)
+        else:
+            logger.warning("FSDP auto_wrap_layers not found in model; wrapping full model.")
+
+    mp_policy = None
+    if mixed_precision == "bf16":
+        mp_policy = MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
+        )
+
+    fsdp_plugin = FullyShardedDataParallelPlugin(
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        auto_wrap_policy=auto_wrap_policy,
+        mixed_precision_policy=mp_policy,
+        state_dict_type=StateDictType.FULL_STATE_DICT,
+        state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+        limit_all_gathers=bool(fsdp_config.get("limit_all_gathers", True)),
+    )
+    return Accelerator(mixed_precision=mixed_precision, fsdp_plugin=fsdp_plugin)
+
 @torch.no_grad()
-def evaluate(policy, ref_model, val_loader, beta, device):
+def evaluate(policy, ref_model, val_loader, beta, accelerator):
     policy_was_training = policy.training
     policy.eval()
     ref_model.eval()
 
-    total_loss = 0.0
-    total_count = 0
-    sum_chosen_rewards = 0.0
-    sum_rejected_rewards = 0.0
-    correct = 0  
+    total_loss = torch.tensor(0.0, device=accelerator.device)
+    total_count = torch.tensor(0.0, device=accelerator.device)
+    sum_chosen_rewards = torch.tensor(0.0, device=accelerator.device)
+    sum_rejected_rewards = torch.tensor(0.0, device=accelerator.device)
+    correct = torch.tensor(0.0, device=accelerator.device)
 
-    pbar = tqdm(val_loader, desc="Evaluating", leave=False, dynamic_ncols=True)
+    pbar = tqdm(
+        val_loader,
+        desc="Evaluating",
+        leave=False,
+        dynamic_ncols=True,
+        disable=not accelerator.is_main_process,
+    )
 
     for batch in pbar:
-        batch = to_device_batch(batch, device)
+        batch = to_device_batch(batch, accelerator.device)
 
-        policy_chosen_log_prob, policy_rejected_log_prob, ref_chosen_log_prob, ref_rejected_log_prob = compute_batch_log_prob(
-            batch, policy=policy, ref_model=ref_model
-        )
+        with accelerator.autocast():
+            policy_chosen_log_prob, policy_rejected_log_prob, ref_chosen_log_prob, ref_rejected_log_prob = compute_batch_log_prob(
+                batch, policy=policy, ref_model=ref_model
+            )
 
-        loss_vec, chosen_rewards, rejected_rewards = dpo_loss(
-            policy_chosen_log_prob,
-            policy_rejected_log_prob,
-            ref_chosen_log_prob,
-            ref_rejected_log_prob,
-            beta
-        )
+            loss_vec, chosen_rewards, rejected_rewards = dpo_loss(
+                policy_chosen_log_prob,
+                policy_rejected_log_prob,
+                ref_chosen_log_prob,
+                ref_rejected_log_prob,
+                beta
+            )
 
-        batches = loss_vec.shape[0]
-        total_loss += loss_vec.mean().item() * batches
-        total_count += batches
-        sum_chosen_rewards += chosen_rewards.mean().item() * batches
-        sum_rejected_rewards += rejected_rewards.mean().item() * batches
-        correct += (chosen_rewards > rejected_rewards).sum().item()
-        
-    metrics = {
-        "eval_loss": total_loss / max(1, total_count),
-        "eval_chosen_rewards": sum_chosen_rewards / max(1, total_count),
-        "eval_rejected_rewards": sum_rejected_rewards / max(1, total_count),
-        "eval_reward_accuracy": correct / max(1, total_count),
-    }
+        total_loss += loss_vec.sum()
+        total_count += loss_vec.shape[0]
+        sum_chosen_rewards += chosen_rewards.sum()
+        sum_rejected_rewards += rejected_rewards.sum()
+        correct += (chosen_rewards > rejected_rewards).sum()
+
+    total_loss = accelerator.reduce(total_loss, reduction="sum")
+    total_count = accelerator.reduce(total_count, reduction="sum")
+    sum_chosen_rewards = accelerator.reduce(sum_chosen_rewards, reduction="sum")
+    sum_rejected_rewards = accelerator.reduce(sum_rejected_rewards, reduction="sum")
+    correct = accelerator.reduce(correct, reduction="sum")
+
+    metrics = {}
+    if accelerator.is_main_process:
+        denom = max(1.0, total_count.item())
+        metrics = {
+            "eval_loss": total_loss.item() / denom,
+            "eval_chosen_rewards": sum_chosen_rewards.item() / denom,
+            "eval_rejected_rewards": sum_rejected_rewards.item() / denom,
+            "eval_reward_accuracy": correct.item() / denom,
+        }
             
     if policy_was_training:
         policy.train()
@@ -97,20 +165,10 @@ def train(config_path: str, mode: str = "dynamic"):
     mode: 'dynamic' or 'static'
     """
     config = load_yaml_config(config_path)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    seed_everything(config['dataset'].get('seed', 42))
-
-    wandb.init(
-        project=config.get('wandb_project', 'handwritten-dpo'),
-        name=config.get('run_name', 'run'),
-        config=config
-    )
-
     # Load models
     policy_name = config['policy_name']
     ref_name = config['ref_name']
-    policy = AutoModelForCausalLM.from_pretrained(policy_name).to(device)
+    policy = AutoModelForCausalLM.from_pretrained(policy_name)
     tok = AutoTokenizer.from_pretrained(policy_name)
     policy.config.pad_token_id = tok.pad_token_id
 
@@ -119,22 +177,41 @@ def train(config_path: str, mode: str = "dynamic"):
         tok.pad_token = tok.eos_token
         tok.pad_token_id = tok.eos_token_id
 
-    ref_model = AutoModelForCausalLM.from_pretrained(ref_name).to(device)
+    ref_model = AutoModelForCausalLM.from_pretrained(ref_name)
     ref_model.config.pad_token_id = tok.pad_token_id
     ref_model.requires_grad_(False)
-    
-    train_loader, val_loader = build_train_val(config=config, tokenizer=tok)
 
-    policy.train()
-    ref_model.eval()
+    use_bf16 = config['precision'] == 'bf16' and torch.cuda.is_available()
+    mixed_precision = "bf16" if use_bf16 else "no"
+    accelerator = build_accelerator(config, policy, mixed_precision=mixed_precision)
+    device = accelerator.device
+
+    seed = config['dataset'].get('seed', 42)
+    seed_everything(seed + accelerator.process_index)
+
+    if accelerator.is_main_process:
+        wandb.init(
+            project=config.get('wandb_project', 'handwritten-dpo'),
+            name=config.get('run_name', 'run'),
+            config=config
+        )
+
+    config.setdefault("distributed", {})
+    config["distributed"]["world_size"] = accelerator.num_processes
+    config["distributed"]["rank"] = accelerator.process_index
+
+    train_loader, val_loader, train_sampler, val_sampler = build_train_val(config=config, tokenizer=tok)
 
     optimizer = AdamW(params=policy.parameters(), lr=float(config['dpo_training']['learning_rate']))
+    policy, optimizer, train_loader, val_loader = accelerator.prepare(
+        policy, optimizer, train_loader, val_loader
+    )
 
-    use_bf16 = config['precision'] == 'bf16'
-    use_amp = use_bf16 and device == "cuda"
     if use_bf16:
-        policy.to(dtype=torch.bfloat16)
         ref_model.to(dtype=torch.bfloat16)
+    ref_model.to(device)
+    policy.train()
+    ref_model.eval()
 
     # Logging setup
     # Determine log dir based on mode or config
@@ -142,9 +219,12 @@ def train(config_path: str, mode: str = "dynamic"):
          LOG_DIR = config['margin_log'].get('log_dir', 'logs/margins')
     else:
          LOG_DIR = config['margin_log'].get('dpo_log_dir', 'logs/dpo_margins')
-         
-    os.makedirs(LOG_DIR, exist_ok=True)
-    JSONL_PATH = os.path.join(LOG_DIR, "margins_log.jsonl")
+    
+    if accelerator.is_main_process:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        JSONL_PATH = os.path.join(LOG_DIR, "margins_log.jsonl")
+    else:
+        JSONL_PATH = None
 
     # Dynamic DPO specific setup
     is_dynamic = (mode == 'dynamic')
@@ -166,9 +246,11 @@ def train(config_path: str, mode: str = "dynamic"):
         beta_min = float(config['beta_update']['beta_min'])
         
         beta = beta_0 # start with beta_0
-        
-        risk_stat = {"total": 0, "fail": 0}
-        log_f = open("risk_test_and_beta_log.jsonl", "w", encoding="utf-8")
+
+        risk_stat = {"total": 0, "fail": 0} if accelerator.is_main_process else None
+        log_f = None
+        if accelerator.is_main_process:
+            log_f = open("risk_test_and_beta_log.jsonl", "w", encoding="utf-8")
         warmup_steps = int(config['dpo_training']['warmup_steps'])
         warmup_done = warmup_steps <= 0
         warmup_count = 0
@@ -189,20 +271,32 @@ def train(config_path: str, mode: str = "dynamic"):
     margin_log_save_npy = bool(margin_log_cfg.get('save_npy', True))
 
     for epoch in range(epochs):
-        epoch_dir = os.path.join(LOG_DIR, f"epoch_{epoch:03d}")
-        os.makedirs(epoch_dir, exist_ok=True)
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        if val_sampler is not None:
+            val_sampler.set_epoch(epoch)
 
-        pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"train | epoch {epoch+1}/{epochs}", dynamic_ncols=True, leave=False)
+        if accelerator.is_main_process:
+            epoch_dir = os.path.join(LOG_DIR, f"epoch_{epoch:03d}")
+            os.makedirs(epoch_dir, exist_ok=True)
+        else:
+            epoch_dir = None
+
+        pbar = tqdm(
+            enumerate(train_loader),
+            total=len(train_loader),
+            desc=f"train | epoch {epoch+1}/{epochs}",
+            dynamic_ncols=True,
+            leave=False,
+            disable=not accelerator.is_main_process,
+        )
         
         running_loss = 0.0
         
         for step, batch in pbar:
-            if batch is None:
-                continue
             batch = to_device_batch(batch, device)
 
-            amp_ctx = torch.cuda.amp.autocast(dtype=torch.bfloat16) if use_amp else nullcontext()
-            with amp_ctx:
+            with accelerator.autocast():
                 policy_chosen_log_prob, policy_rejected_log_prob, ref_chosen_log_prob, ref_rejected_log_prob = compute_batch_log_prob(
                     batch, policy=policy, ref_model=ref_model
                 )
@@ -219,43 +313,66 @@ def train(config_path: str, mode: str = "dynamic"):
                         warmup_count += 1
                         if warmup_count >= warmup_steps:
                             tau_0 = threshold_accumulator.finalize()
+                            tau_0_tensor = torch.tensor(tau_0, device=device)
+                            if accelerator.num_processes > 1:
+                                tau_0 = accelerator.reduce(tau_0_tensor, reduction="mean").item()
                             ema = EMAUpdate(tau_0=tau_0, q=q, momentum=momentum)
                             warmup_done = True
-                            log_f.write(json.dumps({
-                                "type": "warmup_end",
-                                "tau_0": float(tau_0),
-                                "beta_0": float(beta)
-                            }) + "\n")
-                            log_f.flush()
+                            if log_f is not None:
+                                log_f.write(json.dumps({
+                                    "type": "warmup_end",
+                                    "tau_0": float(tau_0),
+                                    "beta_0": float(beta)
+                                }) + "\n")
+                                log_f.flush()
                         beta_used = beta_0
                     else:
-                        tau = ema.update_tau(model_margin)
-                        num_margin = int(model_margin.numel())
-                        p_hat = empirical_over_threshold_proportion(model_margin, tau)
-                        is_over_risk, eplison, delta_prime = risk_test(p_hat=p_hat, eplison_0=eplison_0, delta=delta, n=num_margin)
+                        if accelerator.num_processes > 1:
+                            batch_tau = torch.quantile(model_margin.detach().float(), q).item()
+                            batch_tau_tensor = torch.tensor(batch_tau, device=device)
+                            batch_tau = accelerator.reduce(batch_tau_tensor, reduction="mean").item()
+                            tau = ema.update_tau_from_value(batch_tau)
+                        else:
+                            tau = ema.update_tau(model_margin)
+
+                        num_over = (model_margin >= tau).sum().float()
+                        num_total = torch.tensor(float(model_margin.numel()), device=device)
+                        if accelerator.num_processes > 1:
+                            num_over = accelerator.reduce(num_over, reduction="sum")
+                            num_total = accelerator.reduce(num_total, reduction="sum")
+                        p_hat = (num_over / num_total).item()
+                        num_margin = int(num_total.item())
+                        is_over_risk, eplison, delta_prime = risk_test(
+                            p_hat=p_hat,
+                            eplison_0=eplison_0,
+                            delta=delta,
+                            n=num_margin,
+                        )
 
                         beta, u_k, s_k, alpha_used = update_beta(
                             beta, p_hat, delta_prime, eplison, alpha, gamma, beta_min, beta_max
                         )
                         beta_used = beta
 
-                        risk_stat["total"] += 1
-                        if is_over_risk:
-                            risk_stat["fail"] += 1
+                        if risk_stat is not None:
+                            risk_stat["total"] += 1
+                            if is_over_risk:
+                                risk_stat["fail"] += 1
 
-                        log_f.write(json.dumps({
-                            "step": int(global_steps),
-                            "tau": float(tau),
-                            "p_hat": float(p_hat),
-                            "risk_over": bool(is_over_risk),
-                            "beta": float(beta),
-                            "u_k": float(u_k),
-                            "s_k": float(s_k),
-                            "alpha": float(alpha_used),
-                        }) + "\n")
-                        log_f.flush()
+                        if log_f is not None:
+                            log_f.write(json.dumps({
+                                "step": int(global_steps),
+                                "tau": float(tau),
+                                "p_hat": float(p_hat),
+                                "risk_over": bool(is_over_risk),
+                                "beta": float(beta),
+                                "u_k": float(u_k),
+                                "s_k": float(s_k),
+                                "alpha": float(alpha_used),
+                            }) + "\n")
+                            log_f.flush()
 
-                if margin_log_every > 0 and (global_steps % margin_log_every == 0):
+                if accelerator.is_main_process and margin_log_every > 0 and (global_steps % margin_log_every == 0):
                     compute_and_log_model_margin(
                         model_margin=model_margin,
                         epoch_dir=epoch_dir,
@@ -276,35 +393,18 @@ def train(config_path: str, mode: str = "dynamic"):
                 avg_model_margin = model_margin.mean()
 
             optimizer.zero_grad()
-            loss.backward()
-            
-            # Dynamic often clips grad only after warmup, but static usually always clips. 
-            # In original training.py (dynamic), clip is always on. 
-            # Wait, original training.py: lines 205-211 had `if global_steps >= warmup_steps:` wrapper, but that was probably for stepping optimizer?
-            # Re-reading original `training.py` code provided in view_file:
-            # Lines 297: `torch.nn.utils.clip_grad_norm_` is UNCONDITIONALLY called.
-            # Lines 298: `optimizer.step()` is UNCONDITIONALLY called.
-            # Ah, wait. In `dpo_training.py` (static), lines 206-210 had `if global_steps >= warmup_steps: clip; step;`.
-            # This logic seems divergent. I will unify to standard DPO practice: always step. "Warmup" usually refers to LR schedule or beta warmup.
-            # However, if the user intended to freeze updates during warmup, I should respect that.
-            # Let's check `training.py` (dynamic) loop again.
-            # lines 295-298: just zero_grad, backward, clip, step. No warmup check.
-            # So dynamic DPO *updates* weights during beta warmup.
-            # Now `dpo_training.py` (static):
-            # lines 205: `if global_steps >= warmup_steps:` then clip and step.
-            # This implies static DPO *skips* updates for the first N steps? That's odd. Usually warmup means LR warmup.
-            # Maybe `warmup_steps` here means "reference model warmup" or something? No, it's DPO.
-            # I will follow `training.py` behavior (always update) as it seems more standard, unless `dpo_training.py` has a specific reason.
-            # Given `dpo_training.py` was likely an earlier or alternative experiment, and `training.py` is the main dynamic one, I'll stick to `training.py`'s update logic (always update).
-            # If `dpo_training.py` really wanted to skip steps, that's a very specific behavior. I'll make it always update for now to be safe and consistent.
-            
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=max_grad_norm)
+            accelerator.backward(loss)
+
+            if isinstance(policy, FSDP):
+                FSDP.clip_grad_norm_(policy, max_norm=max_grad_norm)
+            else:
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=max_grad_norm)
             optimizer.step()
             
             global_steps += 1 
             running_loss += loss.item()
             
-            if (step + 1) % log_steps == 0:
+            if accelerator.is_main_process and (step + 1) % log_steps == 0:
                 avg_loss = running_loss / log_steps
                 pbar.set_postfix(loss=f"{avg_loss:.3f}")
                 wandb.log({
@@ -316,18 +416,25 @@ def train(config_path: str, mode: str = "dynamic"):
                 })
                 running_loss = 0.0
 
-        eval_metrics = evaluate(policy, ref_model, val_loader, beta=beta_used, device=device)
-        logger.info(f"[eval] loss={eval_metrics['eval_loss']:.4f} acc={eval_metrics['eval_reward_accuracy']:.3f}")
-        wandb.log(eval_metrics)
+        eval_metrics = evaluate(policy, ref_model, val_loader, beta=beta_used, accelerator=accelerator)
+        if accelerator.is_main_process:
+            logger.info(f"[eval] loss={eval_metrics['eval_loss']:.4f} acc={eval_metrics['eval_reward_accuracy']:.3f}")
+            wandb.log(eval_metrics)
 
         if is_dynamic:
-             logger.info(f"[RISK] fail {risk_stat['fail']} / {risk_stat['total']}")
+            if accelerator.is_main_process and risk_stat is not None:
+                logger.info(f"[RISK] fail {risk_stat['fail']} / {risk_stat['total']}")
 
     if is_dynamic:
-        log_f.close()
+        if log_f is not None:
+            log_f.close()
 
     save_dir = config['dpo_training'].get('save_dir', 'dpo_model')
-    policy.save_pretrained(save_dir)
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        state_dict = accelerator.get_state_dict(policy)
+        unwrapped = accelerator.unwrap_model(policy)
+        unwrapped.save_pretrained(save_dir, state_dict=state_dict)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

@@ -182,6 +182,10 @@ class EMAUpdate:
         self.tau = (1.0 - self.lam) * self.tau + self.lam * batch_tau
         return self.tau
 
+    def update_tau_from_value(self, batch_tau: float):
+        self.tau = (1.0 - self.lam) * self.tau + self.lam * float(batch_tau)
+        return self.tau
+
 def empirical_over_threshold_proportion(margins: torch.Tensor, threshold):
     return (margins >= threshold).float().mean().item()
 

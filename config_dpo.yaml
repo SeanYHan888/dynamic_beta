@@ -50,5 +50,11 @@ margin_log:
   sample_size: 64
   save_npy: true
 
+fsdp:
+  enabled: true
+  auto_wrap_layers:
+    - LlamaDecoderLayer
+  limit_all_gathers: true
+
 
 
