@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+.env
+wandb/
+Experiment1/
+eval_outputs/
+logs/
+dpo_model/
+dynamic_dpo_model/
