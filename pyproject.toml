@@ -1,7 +1,7 @@
 [project]
 name = "dynamic-beta"
 version = "0.1.0"
-description = "Add your description here"
+description = "Dynamic DPO implementation"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -17,3 +17,16 @@ dependencies = [
     "trl>=0.26.2",
     "wandb>=0.23.1",
 ]
+
+[project.scripts]
+dynamic-dpo-train = "dynamic_dpo.train:train"
+
+[tool.uv]
+dev-dependencies = [
+    "ruff>=0.9.1",
+]
+
+[tool.ruff]
+line-length = 120
+indent-width = 4
+target-version = "py313"
