@@ -1,0 +1,37 @@
+Steps： 
+python3 -m venv dpo-env
+
+source dpo-env/bin/activate
+
+pip install -r requirements.txt
+
+huggingface-cli login
+
+llama3.2 1B: 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
+
+llama-3.2-1b_instruct: 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
+
+
+python training.py --config config_dpo.yaml
+
+python dpo_training.py --config config_dpo.yaml
+
+python hf_dpo_training.py --config config_dpo.yaml
+
+python gen_hh_answer.py --config config_dpo.yaml
+
+export OPENAI_API_KEY=""
+
+python 01_build_pairs.py --in_jsonl eval_outputs/ref_out.jsonl --out_pairs eval/pairs_ref.jsonl
+python 01_build_pairs.py --in_jsonl eval_outputs/dpo_out.jsonl --out_pairs eval/pairs_dpo.jsonl
+python 01_build_pairs.py --in_jsonl eval_outputs/dynamic_dpo_out.jsonl --out_pairs eval/pairs_dynamic.jsonl
+
+
+python 02_gpt_judge.py --pairs eval/pairs_ref.jsonl --out eval/judgments_ref.jsonl --judge_model gpt-4o
+python 02_gpt_judge.py --pairs eval/pairs_dpo.jsonl --out eval/judgments_dpo.jsonl --judge_model gpt-4o
+python 02_gpt_judge.py --pairs eval/pairs_dynamic.jsonl --out eval/judgments_dynamic.jsonl --judge_model gpt-4o
+
+python 03_summarize_results.py \
+  --judgments eval/judgments_ref.jsonl,eval/judgments_dpo.jsonl,eval/judgments_dynamic.jsonl \
+  --out_json eval/summary_all.json
+
