@@ -1,4 +1,5 @@
 from functools import partial
+import logging
 from typing import Any, Dict, Tuple
 
 import torch
@@ -7,6 +8,8 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 ASSISTANT_TAG = "\n\nAssistant:"
+
+logger = logging.getLogger(__name__)
 
 
 def strip_one_leading_newline(text: str) -> str:
@@ -97,6 +100,26 @@ def _encode_and_pad(texts, tokenizer, max_len: int, add_bos: bool, add_eos: bool
         max_length=max_len,
         return_tensors="pt",
     )
+
+
+def _filter_by_prompt_length(dataset: Dataset, tokenizer, max_len: int, add_bos: bool, add_eos: bool, min_response_tokens: int):
+    bos_shift = 1 if add_bos and tokenizer.bos_token_id is not None else 0
+    eos_shift = 1 if add_eos and tokenizer.eos_token_id is not None else 0
+    max_prompt_len = max_len - eos_shift - min_response_tokens
+
+    if max_prompt_len <= 0:
+        return dataset.select([])
+
+    def _prompt_len(batch):
+        enc = tokenizer(batch["prompt"], add_special_tokens=False, return_length=True)
+        lengths = enc["length"]
+        if bos_shift:
+            lengths = [length + bos_shift for length in lengths]
+        return {"prompt_len": lengths}
+
+    dataset = dataset.map(_prompt_len, batched=True)
+    dataset = dataset.filter(lambda row: row["prompt_len"] <= max_prompt_len)
+    return dataset.remove_columns([col for col in dataset.column_names if col == "prompt_len"])
 
 
 def collate_fn(batch, tokenizer, max_len: int, add_bos_token=None, add_eos_token=None) -> Dict[str, torch.Tensor]:
@@ -193,9 +216,27 @@ def build_train_val(config: Dict[str, Any], tokenizer):
     drop_last = bool(training_cfg.get("drop_last", False))
     add_bos_token = dataset_cfg.get("add_bos_token")
     add_eos_token = dataset_cfg.get("add_eos_token")
+    min_response_tokens = int(dataset_cfg.get("min_response_tokens", 1))
 
     ds = load_dataset(raw_dataset, split=split)
+    logger.info("dataset split=%s raw_len=%d", split, len(ds))
     ds_triple = build_hh_dataset(ds)
+    logger.info("dataset filtered_len=%d", len(ds_triple))
+    add_bos, add_eos = _resolve_special_tokens(tokenizer, add_bos_token, add_eos_token)
+    ds_triple = _filter_by_prompt_length(
+        ds_triple,
+        tokenizer,
+        max_len=max_len,
+        add_bos=add_bos,
+        add_eos=add_eos,
+        min_response_tokens=min_response_tokens,
+    )
+    logger.info(
+        "dataset prompt_filter_len=%d max_len=%d min_response_tokens=%d",
+        len(ds_triple),
+        max_len,
+        min_response_tokens,
+    )
 
     if 0.0 < val_ratio < 1.0:
         split_ds = ds_triple.train_test_split(test_size=val_ratio, seed=seed)
@@ -203,6 +244,7 @@ def build_train_val(config: Dict[str, Any], tokenizer):
     else:
         train_ds_raw = ds_triple
         val_ds_raw = ds_triple.select([])
+    logger.info("dataset train_len=%d val_len=%d val_ratio=%.3f", len(train_ds_raw), len(val_ds_raw), val_ratio)
 
     collate = partial(
         collate_fn,
@@ -236,6 +278,15 @@ def build_train_val(config: Dict[str, Any], tokenizer):
         drop_last=False,
     )
 
+    dist_cfg = config.get("distributed", {})
+    logger.info(
+        "dataloader steps=%d batch_size=%d world_size=%d drop_last=%s",
+        len(train_loader),
+        batch_size,
+        int(dist_cfg.get("world_size", 1)),
+        drop_last,
+    )
+
     return train_loader, val_loader, train_sampler, val_sampler
 
 
@@ -253,9 +304,19 @@ def build_eval_loader(config: Dict[str, Any], tokenizer):
     limit = int(test_cfg.get("test_num", 0))
     add_bos_token = test_cfg.get("add_bos_token", dataset_cfg.get("add_bos_token"))
     add_eos_token = test_cfg.get("add_eos_token", dataset_cfg.get("add_eos_token"))
+    min_response_tokens = int(test_cfg.get("min_response_tokens", dataset_cfg.get("min_response_tokens", 1)))
 
     ds = load_dataset(raw_dataset, split=split)
     ds_triple = build_hh_dataset(ds)
+    add_bos, add_eos = _resolve_special_tokens(tokenizer, add_bos_token, add_eos_token)
+    ds_triple = _filter_by_prompt_length(
+        ds_triple,
+        tokenizer,
+        max_len=max_len,
+        add_bos=add_bos,
+        add_eos=add_eos,
+        min_response_tokens=min_response_tokens,
+    )
     if limit > 0:
         ds_triple = ds_triple.select(range(min(limit, len(ds_triple))))
 

@@ -4,7 +4,7 @@ precision: bf16
 
 dataset:
   dataset_name: Anthropic/hh-rlhf
-  subset: train[:20%]
+  subset: train[:100%]
   val_ratio: 0.1
   seed: 42
   max_len: 512
