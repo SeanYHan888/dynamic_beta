@@ -6,11 +6,12 @@ from transformers import AutoTokenizer
 dataset_name = "Anthropic/hh-rlhf"
 subset = "train[:20%]"
 max_len = 512
+min_response_tokens = 32
 policy_name = "meta-llama/Llama-3.2-1B"
 
 print(f"\n=== Debugging Dataset Processing ===")
 print(f"Dataset: {dataset_name} | Subset: {subset}")
-print(f"Max Len: {max_len} | Tokenizer: {policy_name}")
+print(f"Max Len: {max_len} | Min Response Tokens: {min_response_tokens} | Tokenizer: {policy_name}")
 
 print(f"\n1. Loading Dataset...")
 ds = load_dataset(dataset_name, split=subset)
@@ -72,7 +73,7 @@ print(f"   Valid Records: {structure_count:,}")
 print(f"   Dropped: {dropped_structure:,} ({dropped_structure/initial_count:.1%})")
 
 # --- Length Filter ---
-print(f"\n3. Applying Length Filter (Prompt < {max_len} tokens)...")
+print(f"\n3. Applying Length Filter (Prompt < {max_len - min_response_tokens} tokens)...")
 
 # We need to extract prompts first to check length exactly as code does
 def map_prompts(batch):
@@ -92,7 +93,10 @@ def check_len(batch):
     return {"prompt_len": lens}
 
 ds_triple = ds_triple.map(check_len, batched=True, desc="Tokenizing prompts")
-ds_triple = ds_triple.filter(lambda x: x["prompt_len"] < max_len, desc="Filtering too long")
+max_prompt_len = max_len - min_response_tokens
+if max_prompt_len < 1:
+    raise ValueError("min_response_tokens must be smaller than max_len.")
+ds_triple = ds_triple.filter(lambda x: x["prompt_len"] < max_prompt_len, desc="Filtering too long")
 len_count = len(ds_triple)
 dropped_len = structure_count - len_count
 print(f"   Records Fitting Length: {len_count:,}")

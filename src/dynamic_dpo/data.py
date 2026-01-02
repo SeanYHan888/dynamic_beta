@@ -188,6 +188,7 @@ def build_train_val(config, tokenizer):
     val_ratio = float(config['dataset']['val_ratio'])
     seed = int(config['dataset']['seed'])
     max_len = int(config['dataset']['max_len'])
+    min_response_tokens = int(config['dataset'].get('min_response_tokens', 0))
     batch_size = int(config['dpo_training']['batch_size'])
 
     ds = load_dataset(raw_dataset, split=split)
@@ -203,7 +204,10 @@ def build_train_val(config, tokenizer):
         return {"prompt_len": lens}
 
     ds_triple = ds_triple.map(add_prompt_len, batched=True)
-    ds_triple = ds_triple.filter(lambda x: x["prompt_len"] < max_len)
+    max_prompt_len = max_len - min_response_tokens
+    if max_prompt_len < 1:
+        raise ValueError("min_response_tokens must be smaller than max_len.")
+    ds_triple = ds_triple.filter(lambda x: x["prompt_len"] < max_prompt_len)
     ds_triple = ds_triple.remove_columns(["prompt_len"])
 
     split_ds = ds_triple.train_test_split(test_size=val_ratio, seed=seed)

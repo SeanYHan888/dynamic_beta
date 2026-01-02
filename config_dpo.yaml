@@ -8,6 +8,7 @@ dataset:
   val_ratio: 0.1
   seed: 42
   max_len: 512
+  min_response_tokens: 32
   
 dpo_training:
   epochs: 1
