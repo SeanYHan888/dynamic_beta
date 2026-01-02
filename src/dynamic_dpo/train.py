@@ -30,6 +30,7 @@ from .modeling import (
     compute_batch_log_prob,
     risk_test, 
     update_beta,
+    empirical_over_threshold_proportion,
     WarmupQuantileAccumulator,
     EMAUpdate
 )
@@ -271,9 +272,15 @@ def train(config_path: str, mode: str = "dynamic"):
     margin_log_save_npy = bool(margin_log_cfg.get('save_npy', True))
 
     for epoch in range(epochs):
-        if train_sampler is not None:
+        # Handle shuffling for Accelerate-prepared loaders or manual samplers
+        if hasattr(train_loader, "set_epoch"):
+            train_loader.set_epoch(epoch)
+        elif train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        if val_sampler is not None:
+            
+        if hasattr(val_loader, "set_epoch"):
+            val_loader.set_epoch(epoch)
+        elif val_sampler is not None:
             val_sampler.set_epoch(epoch)
 
         if accelerator.is_main_process:

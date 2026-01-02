@@ -211,48 +211,25 @@ def build_train_val(config, tokenizer):
 
     ds_collate = partial(collate_fn, tokenizer=tokenizer, max_len=max_len)
 
-    distributed = config.get("distributed", {})
-    world_size = int(distributed.get("world_size", 1))
-    rank = int(distributed.get("rank", 0))
-    use_distributed = world_size > 1
-
-    train_sampler = None
-    val_sampler = None
-    if use_distributed:
-        train_sampler = DistributedSampler(
-            train_ds_raw,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True,
-            seed=seed,
-        )
-        val_sampler = DistributedSampler(
-            val_ds_raw,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=False,
-            seed=seed,
-            drop_last=False,
-        )
-
+    # When using Accelerate, we do NOT need to manually use DistributedSampler.
+    # Accelerate will automatically shard the DataLoader for us during `prepare`.
+    # Using DistributedSampler + Accelerate causes double-sharding (half data).
+    
     train_loader = DataLoader(
         train_ds_raw,
         batch_size=batch_size,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
-        collate_fn=ds_collate,
+        shuffle=True, # Accelerate handles sampler creation
         pin_memory=True,
     )
     val_loader = DataLoader(
         val_ds_raw,
         batch_size=batch_size,
         shuffle=False,
-        sampler=val_sampler,
-        collate_fn=ds_collate,
         pin_memory=True,
     )
 
-    return train_loader, val_loader, train_sampler, val_sampler
+    # Return None for samplers as they are now handled implicitly or internally
+    return train_loader, val_loader, None, None
 
 
 
