@@ -83,7 +83,7 @@ def build_HH_dataset(ds):
     return ds_triple
 
 
-def collate_fn(batch, tokenizer, max_len):
+def collate_fn(batch, tokenizer, max_len, truncate_prompt=False):
     """
     Input: list of triplets:
       {prompt, chosen, rejected}
@@ -95,65 +95,121 @@ def collate_fn(batch, tokenizer, max_len):
 
     """
 
-    chosen_txt, rejected_txt = [], []
-    prompt_lens = []
-
     if tokenizer.pad_token_id is None:
         # decoder-only models often have no pad token; reuse eos as pad for batching
         tokenizer.pad_token = tokenizer.eos_token
 
-    for item in batch:
-        prompt = str(item['prompt'])
-        chosen = str(item['chosen'])
-        rejected = str(item['rejected'])
+    if truncate_prompt:
+        chosen_input_ids_list = []
+        rejected_input_ids_list = []
+        chosen_attention_mask_list = []
+        rejected_attention_mask_list = []
+        prompt_lens = []
 
-        chosen_txt.append(prompt + chosen)
-        rejected_txt.append(prompt + rejected)
+        add_bos = bool(getattr(tokenizer, "add_bos_token", False)) and tokenizer.bos_token_id is not None
+        add_eos = bool(getattr(tokenizer, "add_eos_token", False)) and tokenizer.eos_token_id is not None
+        bos = [tokenizer.bos_token_id] if add_bos else []
+        eos = [tokenizer.eos_token_id] if add_eos else []
 
-        # prompt_length without special tokens
-        prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
-        prompt_lens.append(len(prompt_ids))
+        for item in batch:
+            prompt = str(item["prompt"])
+            chosen = str(item["chosen"])
+            rejected = str(item["rejected"])
 
-    # chosen, rejected tokens
-    enc_chosen = tokenizer(
-        chosen_txt,
-        padding="max_length",
-        truncation=True,
-        max_length=max_len,
-        return_tensors="pt",
-        add_special_tokens=True,
-    )
+            prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+            chosen_ids = tokenizer(chosen, add_special_tokens=False)["input_ids"]
+            rejected_ids = tokenizer(rejected, add_special_tokens=False)["input_ids"]
 
-    enc_rejected = tokenizer(
-        rejected_txt,
-        padding="max_length",
-        truncation=True,
-        max_length=max_len,
-        return_tensors="pt",
-        add_special_tokens=True,
-    )
+            max_prompt_len = max_len - len(bos) - max(len(chosen_ids), len(rejected_ids)) - len(eos)
+            if max_prompt_len < 0:
+                max_prompt_len = 0
 
-    # If tokenizer adds a BOS token at position 0, prompt length should include it.
-    has_bos = (
-        tokenizer.bos_token_id is not None
-        and enc_chosen.input_ids.size(1) > 0
-        and enc_chosen.input_ids[0, 0].item() == tokenizer.bos_token_id
-    )
-    bos_shift = 1 if has_bos else 0
-    prompt_length = torch.tensor([pl + bos_shift for pl in prompt_lens], dtype=torch.long)
+            if max_prompt_len > 0:
+                prompt_ids = prompt_ids[-max_prompt_len:]
+            else:
+                prompt_ids = []
 
-    max_seq_len = enc_chosen.input_ids.size(1)
-    # If the tokenizer truncated prompts (which happens if truncation=True), we must clamp prompt_length
-    prompt_length = torch.clamp(prompt_length, max=max_seq_len - 1) 
-    
-    keep_mask = prompt_length < max_seq_len
-    if not keep_mask.all():
-         # This should now be impossible due to clamp, but keeping as safeguard
-        raise ValueError("Batch contains prompts that consume full sequence length.")
-    enc_chosen_input_ids = enc_chosen.input_ids
-    enc_chosen_attention_mask = enc_chosen.attention_mask
-    enc_rejected_input_ids = enc_rejected.input_ids
-    enc_rejected_attention_mask = enc_rejected.attention_mask
+            max_response_len = max_len - len(bos) - len(prompt_ids) - len(eos)
+            chosen_ids = chosen_ids[:max_response_len]
+            rejected_ids = rejected_ids[:max_response_len]
+
+            prompt_lens.append(len(bos) + len(prompt_ids))
+
+            chosen_seq = bos + prompt_ids + chosen_ids + eos
+            rejected_seq = bos + prompt_ids + rejected_ids + eos
+
+            chosen_attention = [1] * len(chosen_seq)
+            rejected_attention = [1] * len(rejected_seq)
+
+            chosen_pad = max_len - len(chosen_seq)
+            rejected_pad = max_len - len(rejected_seq)
+
+            chosen_input_ids_list.append(chosen_seq + [tokenizer.pad_token_id] * chosen_pad)
+            rejected_input_ids_list.append(rejected_seq + [tokenizer.pad_token_id] * rejected_pad)
+            chosen_attention_mask_list.append(chosen_attention + [0] * chosen_pad)
+            rejected_attention_mask_list.append(rejected_attention + [0] * rejected_pad)
+
+        enc_chosen_input_ids = torch.tensor(chosen_input_ids_list, dtype=torch.long)
+        enc_chosen_attention_mask = torch.tensor(chosen_attention_mask_list, dtype=torch.long)
+        enc_rejected_input_ids = torch.tensor(rejected_input_ids_list, dtype=torch.long)
+        enc_rejected_attention_mask = torch.tensor(rejected_attention_mask_list, dtype=torch.long)
+        prompt_length = torch.tensor(prompt_lens, dtype=torch.long)
+    else:
+        chosen_txt, rejected_txt = [], []
+        prompt_lens = []
+
+        for item in batch:
+            prompt = str(item['prompt'])
+            chosen = str(item['chosen'])
+            rejected = str(item['rejected'])
+
+            chosen_txt.append(prompt + chosen)
+            rejected_txt.append(prompt + rejected)
+
+            # prompt_length without special tokens
+            prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+            prompt_lens.append(len(prompt_ids))
+
+        # chosen, rejected tokens
+        enc_chosen = tokenizer(
+            chosen_txt,
+            padding="max_length",
+            truncation=True,
+            max_length=max_len,
+            return_tensors="pt",
+            add_special_tokens=True,
+        )
+
+        enc_rejected = tokenizer(
+            rejected_txt,
+            padding="max_length",
+            truncation=True,
+            max_length=max_len,
+            return_tensors="pt",
+            add_special_tokens=True,
+        )
+
+        # If tokenizer adds a BOS token at position 0, prompt length should include it.
+        has_bos = (
+            tokenizer.bos_token_id is not None
+            and enc_chosen.input_ids.size(1) > 0
+            and enc_chosen.input_ids[0, 0].item() == tokenizer.bos_token_id
+        )
+        bos_shift = 1 if has_bos else 0
+        prompt_length = torch.tensor([pl + bos_shift for pl in prompt_lens], dtype=torch.long)
+
+        max_seq_len = enc_chosen.input_ids.size(1)
+        # If the tokenizer truncated prompts (which happens if truncation=True), we must clamp prompt_length
+        prompt_length = torch.clamp(prompt_length, max=max_seq_len - 1) 
+        
+        keep_mask = prompt_length < max_seq_len
+        if not keep_mask.all():
+            # This should now be impossible due to clamp, but keeping as safeguard
+            raise ValueError("Batch contains prompts that consume full sequence length.")
+        enc_chosen_input_ids = enc_chosen.input_ids
+        enc_chosen_attention_mask = enc_chosen.attention_mask
+        enc_rejected_input_ids = enc_rejected.input_ids
+        enc_rejected_attention_mask = enc_rejected.attention_mask
 
     # Build labels: input_ids with prompt tokens masked to -100
     chosen_labels = enc_chosen_input_ids.clone()
@@ -213,7 +269,8 @@ def build_train_val(config, tokenizer):
     split_ds = ds_triple.train_test_split(test_size=val_ratio, seed=seed)
     train_ds_raw, val_ds_raw = split_ds["train"], split_ds["test"]
 
-    ds_collate = partial(collate_fn, tokenizer=tokenizer, max_len=max_len)
+    truncate_prompt = bool(config['dataset'].get('truncate_prompt', False))
+    ds_collate = partial(collate_fn, tokenizer=tokenizer, max_len=max_len, truncate_prompt=truncate_prompt)
 
     # When using Accelerate, we do NOT need to manually use DistributedSampler.
     # Accelerate will automatically shard the DataLoader for us during `prepare`.

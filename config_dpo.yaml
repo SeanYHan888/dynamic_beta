@@ -9,6 +9,7 @@ dataset:
   seed: 42
   max_len: 512
   min_response_tokens: 32
+  truncate_prompt: false
   
 dpo_training:
   epochs: 1
@@ -53,7 +54,7 @@ margin_log:
 
 debug:
   max_batches: 10
-  max_preview_tokens: 64
+  max_preview_tokens: 512
   print_batches: 3
   log_path: logs/debug_batches.jsonl
 
