@@ -143,9 +143,13 @@ def collate_fn(batch, tokenizer, max_len):
     prompt_length = torch.tensor([pl + bos_shift for pl in prompt_lens], dtype=torch.long)
 
     max_seq_len = enc_chosen.input_ids.size(1)
+    # If the tokenizer truncated prompts (which happens if truncation=True), we must clamp prompt_length
+    prompt_length = torch.clamp(prompt_length, max=max_seq_len - 1) 
+    
     keep_mask = prompt_length < max_seq_len
     if not keep_mask.all():
-        raise ValueError("Batch contains prompts that consume full sequence length. Filter dataset before collation.")
+         # This should now be impossible due to clamp, but keeping as safeguard
+        raise ValueError("Batch contains prompts that consume full sequence length.")
     enc_chosen_input_ids = enc_chosen.input_ids
     enc_chosen_attention_mask = enc_chosen.attention_mask
     enc_rejected_input_ids = enc_rejected.input_ids
