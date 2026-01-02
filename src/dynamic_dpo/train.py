@@ -87,16 +87,31 @@ def build_accelerator(config: Dict[str, Any], policy, mixed_precision: str) -> A
                 layer_cls_names,
             )
 
-    mp_policy = None
-    if mixed_precision == "bf16":
-        mp_policy = MixedPrecision(
+    fsdp_version = int(fsdp_config.get("version", fsdp_config.get("fsdp_version", 2)))
+    use_fsdp2 = fsdp_version == 2
+
+    def build_mp_policy(fsdp2: bool):
+        if mixed_precision != "bf16":
+            return None
+        if fsdp2:
+            try:
+                from torch.distributed.fsdp import MixedPrecisionPolicy
+            except ImportError as exc:
+                raise RuntimeError(
+                    "FSDP2 mixed precision requires torch.distributed.fsdp.MixedPrecisionPolicy."
+                ) from exc
+            return MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.bfloat16,
+                buffer_dtype=torch.bfloat16,
+            )
+        return MixedPrecision(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.bfloat16,
             buffer_dtype=torch.bfloat16,
         )
 
-    fsdp_version = int(fsdp_config.get("version", fsdp_config.get("fsdp_version", 2)))
-    use_fsdp2 = fsdp_version == 2
+    mp_policy = build_mp_policy(use_fsdp2)
 
     reshard_cfg = fsdp_config.get("reshard_after_forward", None)
     if use_fsdp2:
@@ -151,6 +166,7 @@ def build_accelerator(config: Dict[str, Any], policy, mixed_precision: str) -> A
             "FSDP2 requested but accelerate.FullyShardedDataParallelPlugin has no fsdp_version; falling back to FSDP1."
         )
         actual_fsdp_version = 1
+        fsdp_plugin_kwargs["mixed_precision_policy"] = build_mp_policy(False)
         if isinstance(reshard_after_forward, bool):
             fsdp_plugin_kwargs["reshard_after_forward"] = (
                 ShardingStrategy.FULL_SHARD if reshard_after_forward else ShardingStrategy.NO_SHARD
@@ -170,6 +186,7 @@ def build_accelerator(config: Dict[str, Any], policy, mixed_precision: str) -> A
                 fsdp_plugin_kwargs["reshard_after_forward"] = (
                     ShardingStrategy.FULL_SHARD if raf else ShardingStrategy.NO_SHARD
                 )
+            fsdp_plugin_kwargs["mixed_precision_policy"] = build_mp_policy(False)
             actual_fsdp_version = 1
             fsdp_plugin = FullyShardedDataParallelPlugin(**fsdp_plugin_kwargs)
         else:
