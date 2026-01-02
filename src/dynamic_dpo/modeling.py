@@ -212,8 +212,17 @@ def build_debug_payload(batch: Dict[str, torch.Tensor], tokenizer, max_preview_t
 
     prompt_length_tensor = batch.get("prompt_length")
     prompt_length = int(prompt_length_tensor[0].item()) if prompt_length_tensor is not None else 0
+    chosen_len = int(chosen_attention_mask[0].sum().item())
+    rejected_len = int(rejected_attention_mask[0].sum().item())
+    prompt_length = max(0, min(prompt_length, chosen_len, rejected_len))
+
     prompt_ids = chosen_input_ids[0][:prompt_length].tolist() if prompt_length > 0 else []
+    chosen_resp_ids = chosen_input_ids[0][prompt_length:chosen_len].tolist()
+    rejected_resp_ids = rejected_input_ids[0][prompt_length:rejected_len].tolist()
+
     prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=True)
+    chosen_text = tokenizer.decode(chosen_resp_ids, skip_special_tokens=True)
+    rejected_text = tokenizer.decode(rejected_resp_ids, skip_special_tokens=True)
 
     def preview(tensor: torch.Tensor) -> list:
         return tensor[0].tolist()[:max_preview_tokens]
@@ -224,6 +233,7 @@ def build_debug_payload(batch: Dict[str, torch.Tensor], tokenizer, max_preview_t
 
     stats = {
         "batch_size": int(chosen_input_ids.size(0)),
+        "prompt_length": int(prompt_length),
         "chosen_supervised_tokens_min": int(chosen_supervised.min().item()),
         "chosen_supervised_tokens_mean": float(chosen_supervised.float().mean().item()),
         "chosen_supervised_tokens_max": int(chosen_supervised.max().item()),
@@ -238,13 +248,17 @@ def build_debug_payload(batch: Dict[str, torch.Tensor], tokenizer, max_preview_t
 
     raw_record = {
         "prompt": prompt_text,
-        "prompt_length": int(prompt_length),
+        "chosen": chosen_text,
+        "rejected": rejected_text,
+    }
+
+    return {
+        "raw_record": raw_record,
         "chosen_input_ids": preview(chosen_input_ids),
         "chosen_attention_mask": preview(chosen_attention_mask),
         "chosen_labels": preview(chosen_labels),
         "rejected_input_ids": preview(rejected_input_ids),
         "rejected_attention_mask": preview(rejected_attention_mask),
         "rejected_labels": preview(rejected_labels),
+        "stats": stats,
     }
-
-    return {"stats": stats, "raw_record": raw_record}

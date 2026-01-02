@@ -330,8 +330,14 @@ def train(config_path: str, mode: str = "dynamic"):
                     debug_log_f.write(json.dumps(debug_record, ensure_ascii=False) + "\n")
                     debug_log_f.flush()
                 if debug_print_left > 0:
-                    logger.info("debug_batch_stats: %s", json.dumps(debug_payload["stats"]))
-                    logger.info("raw_record: %s", json.dumps(debug_payload["raw_record"]))
+                    logger.info("raw_record: %s", repr(debug_payload["raw_record"]))
+                    logger.info("chosen_input_ids: %s", debug_payload["chosen_input_ids"])
+                    logger.info("chosen_attention_mask: %s", debug_payload["chosen_attention_mask"])
+                    logger.info("chosen_labels: %s", debug_payload["chosen_labels"])
+                    logger.info("rejected_input_ids: %s", debug_payload["rejected_input_ids"])
+                    logger.info("rejected_attention_mask: %s", debug_payload["rejected_attention_mask"])
+                    logger.info("rejected_labels: %s", debug_payload["rejected_labels"])
+                    logger.info("debug_stats: %s", json.dumps(debug_payload["stats"]))
                     debug_print_left -= 1
                 debug_batches_left -= 1
 
