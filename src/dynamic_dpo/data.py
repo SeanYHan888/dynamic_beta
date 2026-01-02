@@ -46,7 +46,8 @@ def _row_to_triplet(row: Dict[str, Any]) -> Dict[str, Any]:
             "rejected": rejected_response,
             "is_valid": True,
         }
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Error processing row: {e}")
         return {"prompt": "", "chosen": "", "rejected": "", "is_valid": False}
 
 

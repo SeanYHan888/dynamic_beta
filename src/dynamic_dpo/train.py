@@ -43,8 +43,7 @@ def load_yaml_config(path: str) -> Dict[str, Any]:
     with open(path, 'r') as f:
         return yaml.safe_load(f)
 
-def to_device_batch(batch: Dict[str, Any], device: str) -> Dict[str, Any]:
-    return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+
 
 def seed_everything(seed: int = 42):
     torch.manual_seed(seed)
@@ -119,7 +118,7 @@ def evaluate(policy, ref_model, val_loader, beta, accelerator):
     )
 
     for batch in pbar:
-        batch = to_device_batch(batch, accelerator.device)
+
 
         with accelerator.autocast():
             policy_chosen_log_prob, policy_rejected_log_prob, ref_chosen_log_prob, ref_rejected_log_prob = compute_batch_log_prob(
@@ -286,6 +285,17 @@ def train(config_path: str, mode: str = "dynamic"):
         os.makedirs(os.path.dirname(debug_log_path) or ".", exist_ok=True)
         debug_log_f = open(debug_log_path, "a", encoding="utf-8")
 
+    if accelerator.is_main_process:
+        logger.info("***** Training Configuration *****")
+        logger.info(f"  World Size: {accelerator.num_processes}")
+        logger.info(f"  Per-Device Batch Size: {config['dpo_training']['batch_size']}")
+        logger.info(f"  Gradient Accumulation Steps: {accelerator.gradient_accumulation_steps}")
+        logger.info(f"  Effective Global Batch Size: {accelerator.num_processes * int(config['dpo_training']['batch_size']) * accelerator.gradient_accumulation_steps}")
+        logger.info(f"  Training Dataset Size: {len(train_loader.dataset)}")
+        logger.info(f"  Steps per Epoch: {len(train_loader)}")
+        logger.info(f"  Total Training Steps: {len(train_loader) * epochs}")
+        logger.info("**********************************")
+
     for epoch in range(epochs):
         # Handle shuffling for Accelerate-prepared loaders or manual samplers
         if hasattr(train_loader, "set_epoch"):
@@ -316,7 +326,7 @@ def train(config_path: str, mode: str = "dynamic"):
         running_loss = 0.0
         
         for step, batch in pbar:
-            batch = to_device_batch(batch, device)
+
 
             if accelerator.is_main_process and debug_batches_left > 0:
                 debug_payload = build_debug_payload(batch, tok, max_preview_tokens=debug_max_preview)
@@ -475,6 +485,7 @@ def train(config_path: str, mode: str = "dynamic"):
         state_dict = accelerator.get_state_dict(policy)
         unwrapped = accelerator.unwrap_model(policy)
         unwrapped.save_pretrained(save_dir, state_dict=state_dict)
+        tok.save_pretrained(save_dir)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
