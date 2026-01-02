@@ -7,7 +7,7 @@ Quick start
 - Launch training:
 
 ```bash
-accelerate launch -m dynamic_dpo.train --config config_dpo.yaml --mode dynamic
+uv run accelerate launch -m dynamic_dpo.train --config config_dpo.yaml --mode dynamic
 ```
 
 FSDP notes
