@@ -32,7 +32,8 @@ from .modeling import (
     update_beta,
     empirical_over_threshold_proportion,
     WarmupQuantileAccumulator,
-    EMAUpdate
+    EMAUpdate,
+    build_debug_payload
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -271,6 +272,20 @@ def train(config_path: str, mode: str = "dynamic"):
     margin_log_sample_size = int(margin_log_cfg.get('sample_size', 0))
     margin_log_save_npy = bool(margin_log_cfg.get('save_npy', True))
 
+    debug_cfg = config.get("debug", {})
+    debug_max_batches = int(debug_cfg.get("max_batches", 1))
+    debug_max_preview = int(debug_cfg.get("max_preview_tokens", 64))
+    debug_print_max = int(debug_cfg.get("print_batches", 3))
+    debug_batches_left = debug_max_batches
+    debug_print_left = min(debug_print_max, debug_max_batches)
+    debug_log_f = None
+    if accelerator.is_main_process and debug_max_batches > 0:
+        debug_log_path = debug_cfg.get("log_path")
+        if not debug_log_path:
+            debug_log_path = os.path.join(LOG_DIR, "debug_batches.jsonl")
+        os.makedirs(os.path.dirname(debug_log_path) or ".", exist_ok=True)
+        debug_log_f = open(debug_log_path, "a", encoding="utf-8")
+
     for epoch in range(epochs):
         # Handle shuffling for Accelerate-prepared loaders or manual samplers
         if hasattr(train_loader, "set_epoch"):
@@ -302,6 +317,23 @@ def train(config_path: str, mode: str = "dynamic"):
         
         for step, batch in pbar:
             batch = to_device_batch(batch, device)
+
+            if accelerator.is_main_process and debug_batches_left > 0:
+                debug_payload = build_debug_payload(batch, tok, max_preview_tokens=debug_max_preview)
+                if debug_log_f is not None:
+                    debug_record = {
+                        "epoch": int(epoch),
+                        "step": int(step),
+                        "global_step": int(global_steps),
+                        **debug_payload,
+                    }
+                    debug_log_f.write(json.dumps(debug_record, ensure_ascii=False) + "\n")
+                    debug_log_f.flush()
+                if debug_print_left > 0:
+                    logger.info("debug_batch_stats: %s", json.dumps(debug_payload["stats"]))
+                    logger.info("raw_record: %s", json.dumps(debug_payload["raw_record"]))
+                    debug_print_left -= 1
+                debug_batches_left -= 1
 
             with accelerator.autocast():
                 policy_chosen_log_prob, policy_rejected_log_prob, ref_chosen_log_prob, ref_rejected_log_prob = compute_batch_log_prob(
@@ -428,6 +460,8 @@ def train(config_path: str, mode: str = "dynamic"):
     if is_dynamic:
         if log_f is not None:
             log_f.close()
+    if debug_log_f is not None:
+        debug_log_f.close()
 
     save_dir = config['dpo_training'].get('save_dir', 'dpo_model')
     accelerator.wait_for_everyone()

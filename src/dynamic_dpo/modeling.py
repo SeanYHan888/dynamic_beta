@@ -198,3 +198,53 @@ def update_beta(beta, p_hat, delta_prime, eplison, alpha, gamma, beta_min, beta_
     beta_new = beta * math.exp(alpha * s_k)
     beta_new = max(beta_min, min(beta_new, beta_max))
     return beta_new, u_k, s_k, alpha
+
+
+# --- Debug Utilities ---
+
+def build_debug_payload(batch: Dict[str, torch.Tensor], tokenizer, max_preview_tokens: int = 64) -> Dict[str, Any]:
+    chosen_input_ids = batch["chosen_input_ids"].detach().cpu()
+    chosen_attention_mask = batch["chosen_attention_mask"].detach().cpu()
+    chosen_labels = batch["chosen_labels"].detach().cpu()
+    rejected_input_ids = batch["rejected_input_ids"].detach().cpu()
+    rejected_attention_mask = batch["rejected_attention_mask"].detach().cpu()
+    rejected_labels = batch["rejected_labels"].detach().cpu()
+
+    prompt_length_tensor = batch.get("prompt_length")
+    prompt_length = int(prompt_length_tensor[0].item()) if prompt_length_tensor is not None else 0
+    prompt_ids = chosen_input_ids[0][:prompt_length].tolist() if prompt_length > 0 else []
+    prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=True)
+
+    def preview(tensor: torch.Tensor) -> list:
+        return tensor[0].tolist()[:max_preview_tokens]
+
+    chosen_supervised = (chosen_labels != -100).sum(dim=1)
+    rejected_supervised = (rejected_labels != -100).sum(dim=1)
+    identical_mask = (chosen_input_ids == rejected_input_ids).all(dim=1)
+
+    stats = {
+        "batch_size": int(chosen_input_ids.size(0)),
+        "chosen_supervised_tokens_min": int(chosen_supervised.min().item()),
+        "chosen_supervised_tokens_mean": float(chosen_supervised.float().mean().item()),
+        "chosen_supervised_tokens_max": int(chosen_supervised.max().item()),
+        "rejected_supervised_tokens_min": int(rejected_supervised.min().item()),
+        "rejected_supervised_tokens_mean": float(rejected_supervised.float().mean().item()),
+        "rejected_supervised_tokens_max": int(rejected_supervised.max().item()),
+        "identical_fraction": float(identical_mask.float().mean().item()),
+        "identical_count": int(identical_mask.sum().item()),
+        "seq_len": int(chosen_input_ids.size(1)),
+        "preview_tokens": int(max_preview_tokens),
+    }
+
+    raw_record = {
+        "prompt": prompt_text,
+        "prompt_length": int(prompt_length),
+        "chosen_input_ids": preview(chosen_input_ids),
+        "chosen_attention_mask": preview(chosen_attention_mask),
+        "chosen_labels": preview(chosen_labels),
+        "rejected_input_ids": preview(rejected_input_ids),
+        "rejected_attention_mask": preview(rejected_attention_mask),
+        "rejected_labels": preview(rejected_labels),
+    }
+
+    return {"stats": stats, "raw_record": raw_record}
