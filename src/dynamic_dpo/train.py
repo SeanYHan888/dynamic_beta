@@ -73,12 +73,19 @@ def build_accelerator(config: Dict[str, Any], policy, mixed_precision: str) -> A
 
     auto_wrap_policy = None
     layer_cls_names = fsdp_config.get("auto_wrap_layers", [])
+    if isinstance(layer_cls_names, str):
+        layer_cls_names = [name.strip() for name in layer_cls_names.split(",") if name.strip()]
+    elif layer_cls_names is None:
+        layer_cls_names = []
     if layer_cls_names:
         layer_classes = resolve_fsdp_layer_classes(policy, layer_cls_names)
         if layer_classes:
             auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls=layer_classes)
         else:
-            logger.warning("FSDP auto_wrap_layers not found in model; wrapping full model.")
+            logger.warning(
+                "FSDP auto_wrap_layers not found in model; wrapping full model. auto_wrap_layers=%s",
+                layer_cls_names,
+            )
 
     mp_policy = None
     if mixed_precision == "bf16":

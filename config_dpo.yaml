@@ -60,7 +60,7 @@ debug:
 
 fsdp:
   enabled: true
-  auto_wrap_layers: LlamaDecoderLayer
+  auto_wrap_layers: ["LlamaDecoderLayer"]
   limit_all_gathers: false
 
 
