@@ -84,9 +84,9 @@ def main():
         tok.pad_token_id = tok.eos_token_id
     
     # dpo
-    policy1 = AutoModelForCausalLM.from_pretrained(policy1_path).to(device)
-    policy1.config.pad_token_id = tok.pad_token_id
-    policy1.eval()
+    # policy1 = AutoModelForCausalLM.from_pretrained(policy1_path).to(device)
+    # policy1.config.pad_token_id = tok.pad_token_id
+    # policy1.eval()
 
     # our method
     policy2 = AutoModelForCausalLM.from_pretrained(policy2_path).to(device)
@@ -117,11 +117,11 @@ def main():
     batch_size = int(config['test']['batch_size'])
 
     # policy1 output
-    policy1_outs = generate(policy1, tok, prompts, device, 
-                           max_new_tokens=max_new_tokens, 
-                           temperature=temperature, 
-                           top_p=top_p,
-                           batch_size=batch_size)
+    # policy1_outs = generate(policy1, tok, prompts, device, 
+    #                        max_new_tokens=max_new_tokens, 
+    #                        temperature=temperature, 
+    #                        top_p=top_p,
+    #                        batch_size=batch_size)
     
     # policy2 output
     policy2_outs = generate(policy2, tok, prompts, device, 
@@ -137,25 +137,25 @@ def main():
                            batch_size=batch_size)
     
     # policy1 out
-    policy1_outs_path = config['test']['dpo_out_dir']
-    os.makedirs(os.path.dirname(policy1_outs_path) or ".", exist_ok=True)
-    with open(policy1_outs_path, "w", encoding="utf-8") as f:
-        for it, pol in zip(test_sample, policy1_outs):
-            rec = {
-                "id": it["id"],
-                "prompt": it["prompt"],
-                "chosen_response": it["response"],
-                "model_response": pol,
-                "model_tag": "dpo",
-                "gen": {
-                    "max_new_tokens": max_new_tokens,
-                    "temperature": temperature,
-                    "top_p": top_p,
-                    },
-                    "seed": seed,
-                    }
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    print("Saved policy:", policy1_outs_path)
+    # policy1_outs_path = config['test']['dpo_out_dir']
+    # os.makedirs(os.path.dirname(policy1_outs_path) or ".", exist_ok=True)
+    # with open(policy1_outs_path, "w", encoding="utf-8") as f:
+    #     for it, pol in zip(test_sample, policy1_outs):
+    #         rec = {
+    #             "id": it["id"],
+    #             "prompt": it["prompt"],
+    #             "chosen_response": it["response"],
+    #             "model_response": pol,
+    #             "model_tag": "dpo",
+    #             "gen": {
+    #                 "max_new_tokens": max_new_tokens,
+    #                 "temperature": temperature,
+    #                 "top_p": top_p,
+    #                 },
+    #                 "seed": seed,
+    #                 }
+    #         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    # print("Saved policy:", policy1_outs_path)
 
     # policy2 out
     policy2_outs_path = config['test']['dynamic_dpo_out_dir']

@@ -13,10 +13,10 @@ dataset:
   
 dpo_training:
   epochs: 1
-  batch_size: 4
+  batch_size: 16
   learning_rate: 5e-7
   log_steps: 10
-  warmup_steps: 120
+  warmup_steps: 20
   max_grad_norm: 10
   save_dpo_dir: dpo_model
   save_dir: dynamic_dpo_model
@@ -35,7 +35,7 @@ test:
 
 risk_test:
   delta: 0.1
-  eplison_0: 0.05
+  eplison_0: 0.1
   lambda: 0.05
 
 beta_update:
