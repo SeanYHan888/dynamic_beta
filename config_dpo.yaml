@@ -11,10 +11,10 @@ dataset:
   
 dpo_training:
   epochs: 1
-  batch_size: 8
+  batch_size: 4
   learning_rate: 2e-5
   log_steps: 10
-  warmup_steps: 120
+  warmup_steps: 50
   max_grad_norm: 10
   save_dpo_dir: dpo_model
   save_dir: dynamic_dpo_model
@@ -62,8 +62,6 @@ fsdp:
     - LlamaDecoderLayer
   limit_all_gathers: false
 
-debug:
-  max_batches: 1
-  max_preview_tokens: 64
+
 
 
