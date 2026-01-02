@@ -30,6 +30,7 @@ from .modeling import (
     compute_batch_log_prob,
     risk_test, 
     update_beta,
+    empirical_over_threshold_proportion,
     WarmupQuantileAccumulator,
     EMAUpdate
 )

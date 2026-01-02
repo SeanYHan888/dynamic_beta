@@ -1,120 +1,92 @@
+from functools import partial
+from typing import Any, Dict, Tuple
+
 import torch
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from functools import partial
-
 
 ASSISTANT_TAG = "\n\nAssistant:"
 
-# delete the \n at the beginning of the response
-def strip_one_leading_newline(s): 
-    return s[1:] if s.startswith("\n") else s
 
-def split_prompt_and_response(input_text):
+def strip_one_leading_newline(text: str) -> str:
+    return text[1:] if text.startswith("\n") else text
+
+
+def split_prompt_and_response(input_text: str) -> Tuple[str, str]:
     """
     HH format: multi-turn text containing many "\n\nAssistant:".
-    We take the LAST Assistant tag as the start of the final assistant response.
-
-    Returns:
-    prompt: everything up to and including the final "\n\nAssistant:"
-    response: the assistant completion after that tag (no leading newline)
-    
+    The last Assistant tag marks the start of the final assistant response.
     """
-    input_text = str(input_text).replace("\r\n", "\n").replace("\r", "\n")
-    index = input_text.rfind(ASSISTANT_TAG)
+    normalized = str(input_text).replace("\r\n", "\n").replace("\r", "\n")
+    index = normalized.rfind(ASSISTANT_TAG)
     if index < 0:
         raise ValueError("No '\\n\\nAssistant:' tag found in HH input.")
-    prompt = input_text[:index + len(ASSISTANT_TAG)]
-    response = input_text[index + len(ASSISTANT_TAG):]
-    response = strip_one_leading_newline(response)
+    prompt = normalized[: index + len(ASSISTANT_TAG)]
+    response = strip_one_leading_newline(normalized[index + len(ASSISTANT_TAG) :])
     return prompt, response
 
 
-def convert_to_triples(chosen_text, rejected_text):
-    """
-    convert one HH row into an explicit triplet:
-      {prompt, chosen, rejected}
-
-    """
-    # get prompt and response from chosen_text
-    chosen_prompt, chosen_response = split_prompt_and_response(chosen_text)
-
-    # assume the chosen and rejected prompts are same
-    if not rejected_text.startswith(chosen_prompt):
-        return None
-    
-    rejected_response = strip_one_leading_newline(rejected_text[len(chosen_prompt):])
-    
-    
-    if len(chosen_prompt.strip()) == 0:
-        return None
-    if len(chosen_response.strip()) == 0 or len(rejected_response.strip()) == 0:
-        return None
-    
-    return {"prompt": chosen_prompt,
+def _row_to_triplet(row: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        chosen_text = row["chosen"]
+        rejected_text = row["rejected"]
+        prompt, chosen_response = split_prompt_and_response(chosen_text)
+        if not str(rejected_text).startswith(prompt):
+            return {"prompt": "", "chosen": "", "rejected": "", "is_valid": False}
+        rejected_response = strip_one_leading_newline(str(rejected_text)[len(prompt) :])
+        if not prompt.strip() or not chosen_response.strip() or not rejected_response.strip():
+            return {"prompt": "", "chosen": "", "rejected": "", "is_valid": False}
+        return {
+            "prompt": prompt,
             "chosen": chosen_response,
-            "rejected": rejected_response}
-
-# process entire dataset, build hh dataset
-def build_HH_dataset(ds):
-    def map_fn(batch):
-        prompts, chosens, rejecteds, valids = [], [], [], []
-        for chosen_text, rejected_text in zip(batch["chosen"], batch["rejected"]):
-            output = convert_to_triples(
-                chosen_text=chosen_text,
-                rejected_text=rejected_text,
-            )
-            if output is None:
-                prompts.append("")
-                chosens.append("")
-                rejecteds.append("")
-                valids.append(False)
-            else:
-                prompts.append(output["prompt"])
-                chosens.append(output["chosen"])
-                rejecteds.append(output["rejected"])
-                valids.append(True)
-        return {"prompt": prompts, "chosen": chosens, "rejected": rejecteds, "is_valid": valids}
-
-    ds_triple = ds.map(map_fn, batched=True, remove_columns=ds.column_names)
-    ds_triple = ds_triple.filter(lambda x: x["is_valid"])
-    ds_triple = ds_triple.remove_columns(["is_valid"])
-    return ds_triple
+            "rejected": rejected_response,
+            "is_valid": True,
+        }
+    except Exception:
+        return {"prompt": "", "chosen": "", "rejected": "", "is_valid": False}
 
 
-def collate_fn(batch, tokenizer, max_len):
+def build_hh_dataset(ds: Dataset) -> Dataset:
+    ds = ds.map(_row_to_triplet)
+    ds = ds.filter(lambda row: row["is_valid"])
+    keep_cols = {"prompt", "chosen", "rejected"}
+    drop_cols = [col for col in ds.column_names if col not in keep_cols]
+    if drop_cols:
+        ds = ds.remove_columns(drop_cols)
+    return ds
+
+
+def collate_fn(batch, tokenizer, max_len: int) -> Dict[str, torch.Tensor]:
     """
-    Input: list of triplets:
-      {prompt, chosen, rejected}
-
-    Output tensors:
+    Input: list of triplets {prompt, chosen, rejected}
+    Output:
       chosen_input_ids, chosen_attention_mask, chosen_labels
       rejected_input_ids, rejected_attention_mask, rejected_labels
       prompt_length
-
     """
-
     chosen_txt, rejected_txt = [], []
     prompt_lens = []
 
     if tokenizer.pad_token_id is None:
-        # decoder-only models often have no pad token; reuse eos as pad for batching
         tokenizer.pad_token = tokenizer.eos_token
 
     for item in batch:
-        prompt = str(item['prompt'])
-        chosen = str(item['chosen'])
-        rejected = str(item['rejected'])
+        prompt = str(item["prompt"])
+        chosen = str(item["chosen"])
+        rejected = str(item["rejected"])
 
         chosen_txt.append(prompt + chosen)
         rejected_txt.append(prompt + rejected)
 
-        # prompt_length without special tokens
-        prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        prompt_ids = tokenizer(
+            prompt,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=max_len,
+        )["input_ids"]
         prompt_lens.append(len(prompt_ids))
 
-    # chosen, rejected tokens
     enc_chosen = tokenizer(
         chosen_txt,
         padding="max_length",
@@ -123,7 +95,6 @@ def collate_fn(batch, tokenizer, max_len):
         return_tensors="pt",
         add_special_tokens=True,
     )
-
     enc_rejected = tokenizer(
         rejected_txt,
         padding="max_length",
@@ -133,7 +104,6 @@ def collate_fn(batch, tokenizer, max_len):
         add_special_tokens=True,
     )
 
-    # If tokenizer adds a BOS token at position 0, prompt length should include it.
     has_bos = (
         tokenizer.bos_token_id is not None
         and enc_chosen.input_ids.size(1) > 0
@@ -142,114 +112,126 @@ def collate_fn(batch, tokenizer, max_len):
     bos_shift = 1 if has_bos else 0
     prompt_length = torch.tensor([pl + bos_shift for pl in prompt_lens], dtype=torch.long)
 
-    max_seq_len = enc_chosen.input_ids.size(1)
-    keep_mask = prompt_length < max_seq_len
-    if not keep_mask.all():
-        raise ValueError("Batch contains prompts that consume full sequence length. Filter dataset before collation.")
-    enc_chosen_input_ids = enc_chosen.input_ids
-    enc_chosen_attention_mask = enc_chosen.attention_mask
-    enc_rejected_input_ids = enc_rejected.input_ids
-    enc_rejected_attention_mask = enc_rejected.attention_mask
+    chosen_labels = enc_chosen.input_ids.clone()
+    rejected_labels = enc_rejected.input_ids.clone()
 
-    # Build labels: input_ids with prompt tokens masked to -100
-    chosen_labels = enc_chosen_input_ids.clone()
-    rejected_labels = enc_rejected_input_ids.clone()
     max_seq_len = chosen_labels.size(1)
     for i, pl in enumerate(prompt_length.tolist()):
         pl = min(pl, max_seq_len)
         chosen_labels[i, :pl] = -100
         rejected_labels[i, :pl] = -100
 
-    # mask padding
-    chosen_labels[enc_chosen_attention_mask == 0] = -100
-    rejected_labels[enc_rejected_attention_mask == 0] = -100
+    chosen_labels[enc_chosen.attention_mask == 0] = -100
+    rejected_labels[enc_rejected.attention_mask == 0] = -100
 
     return {
-        "chosen_input_ids": enc_chosen_input_ids,
-        "chosen_attention_mask": enc_chosen_attention_mask,
+        "chosen_input_ids": enc_chosen.input_ids,
+        "chosen_attention_mask": enc_chosen.attention_mask,
         "chosen_labels": chosen_labels,
-
-        "rejected_input_ids": enc_rejected_input_ids,
-        "rejected_attention_mask": enc_rejected_attention_mask,
+        "rejected_input_ids": enc_rejected.input_ids,
+        "rejected_attention_mask": enc_rejected.attention_mask,
         "rejected_labels": rejected_labels,
-
-        # optional: useful for debugging / analysis
         "prompt_length": prompt_length,
     }
 
-# build train, eval dataloader
-def build_train_val(config, tokenizer):
-    raw_dataset = config['dataset']['dataset_name']
-    split = config['dataset']['subset']
-    val_ratio = float(config['dataset']['val_ratio'])
-    seed = int(config['dataset']['seed'])
-    max_len = int(config['dataset']['max_len'])
-    batch_size = int(config['dpo_training']['batch_size'])
+
+def _distributed_samplers(config: Dict[str, Any], dataset, shuffle: bool, seed: int):
+    dist_cfg = config.get("distributed", {})
+    world_size = int(dist_cfg.get("world_size", 1))
+    rank = int(dist_cfg.get("rank", 0))
+    if world_size <= 1:
+        return None
+    return DistributedSampler(
+        dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=shuffle,
+        seed=seed,
+    )
+
+
+def build_train_val(config: Dict[str, Any], tokenizer):
+    dataset_cfg = config.get("dataset", {})
+    training_cfg = config.get("dpo_training", {})
+
+    raw_dataset = dataset_cfg.get("dataset_name", "Anthropic/hh-rlhf")
+    split = dataset_cfg.get("subset", dataset_cfg.get("split", "train"))
+    val_ratio = float(dataset_cfg.get("val_ratio", 0.1))
+    seed = int(dataset_cfg.get("seed", 42))
+    max_len = int(dataset_cfg.get("max_len", 512))
+    batch_size = int(training_cfg.get("batch_size", 1))
+    num_workers = int(dataset_cfg.get("num_workers", training_cfg.get("num_workers", 0)))
+    drop_last = bool(training_cfg.get("drop_last", False))
 
     ds = load_dataset(raw_dataset, split=split)
-    ds_triple = build_HH_dataset(ds)
+    ds_triple = build_hh_dataset(ds)
 
-    bos_shift = 1 if (getattr(tokenizer, "add_bos_token", False) and tokenizer.bos_token_id is not None) else 0
+    if 0.0 < val_ratio < 1.0:
+        split_ds = ds_triple.train_test_split(test_size=val_ratio, seed=seed)
+        train_ds_raw, val_ds_raw = split_ds["train"], split_ds["test"]
+    else:
+        train_ds_raw = ds_triple
+        val_ds_raw = ds_triple.select([])
 
-    def add_prompt_len(batch):
-        lens = [
-            len(tokenizer(p, add_special_tokens=False)["input_ids"]) + bos_shift
-            for p in batch["prompt"]
-        ]
-        return {"prompt_len": lens}
+    collate = partial(collate_fn, tokenizer=tokenizer, max_len=max_len)
 
-    ds_triple = ds_triple.map(add_prompt_len, batched=True)
-    ds_triple = ds_triple.filter(lambda x: x["prompt_len"] < max_len)
-    ds_triple = ds_triple.remove_columns(["prompt_len"])
-
-    split_ds = ds_triple.train_test_split(test_size=val_ratio, seed=seed)
-    train_ds_raw, val_ds_raw = split_ds["train"], split_ds["test"]
-
-    ds_collate = partial(collate_fn, tokenizer=tokenizer, max_len=max_len)
-
-    distributed = config.get("distributed", {})
-    world_size = int(distributed.get("world_size", 1))
-    rank = int(distributed.get("rank", 0))
-    use_distributed = world_size > 1
-
-    train_sampler = None
-    val_sampler = None
-    if use_distributed:
-        train_sampler = DistributedSampler(
-            train_ds_raw,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True,
-            seed=seed,
-        )
-        val_sampler = DistributedSampler(
-            val_ds_raw,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=False,
-            seed=seed,
-            drop_last=False,
-        )
+    train_sampler = _distributed_samplers(config, train_ds_raw, shuffle=True, seed=seed)
+    val_sampler = _distributed_samplers(config, val_ds_raw, shuffle=False, seed=seed)
 
     train_loader = DataLoader(
         train_ds_raw,
         batch_size=batch_size,
-        shuffle=(train_sampler is None),
+        shuffle=train_sampler is None,
         sampler=train_sampler,
-        collate_fn=ds_collate,
-        pin_memory=True,
+        collate_fn=collate,
+        pin_memory=torch.cuda.is_available(),
+        num_workers=num_workers,
+        drop_last=drop_last,
     )
     val_loader = DataLoader(
         val_ds_raw,
         batch_size=batch_size,
         shuffle=False,
         sampler=val_sampler,
-        collate_fn=ds_collate,
-        pin_memory=True,
+        collate_fn=collate,
+        pin_memory=torch.cuda.is_available(),
+        num_workers=num_workers,
+        drop_last=False,
     )
 
     return train_loader, val_loader, train_sampler, val_sampler
 
 
+def build_eval_loader(config: Dict[str, Any], tokenizer):
+    dataset_cfg = config.get("dataset", {})
+    test_cfg = config.get("test", {})
+    training_cfg = config.get("dpo_training", {})
 
+    raw_dataset = test_cfg.get("dataset_name", dataset_cfg.get("dataset_name", "Anthropic/hh-rlhf"))
+    split = test_cfg.get("subset", "test")
+    seed = int(test_cfg.get("seed", dataset_cfg.get("seed", 42)))
+    max_len = int(test_cfg.get("max_len", dataset_cfg.get("max_len", 512)))
+    batch_size = int(test_cfg.get("batch_size", training_cfg.get("batch_size", 1)))
+    num_workers = int(test_cfg.get("num_workers", dataset_cfg.get("num_workers", training_cfg.get("num_workers", 0))))
+    limit = int(test_cfg.get("test_num", 0))
 
+    ds = load_dataset(raw_dataset, split=split)
+    ds_triple = build_hh_dataset(ds)
+    if limit > 0:
+        ds_triple = ds_triple.select(range(min(limit, len(ds_triple))))
+
+    collate = partial(collate_fn, tokenizer=tokenizer, max_len=max_len)
+    eval_sampler = _distributed_samplers(config, ds_triple, shuffle=False, seed=seed)
+
+    eval_loader = DataLoader(
+        ds_triple,
+        batch_size=batch_size,
+        shuffle=False,
+        sampler=eval_sampler,
+        collate_fn=collate,
+        pin_memory=torch.cuda.is_available(),
+        num_workers=num_workers,
+        drop_last=False,
+    )
+
+    return eval_loader, eval_sampler
