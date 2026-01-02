@@ -57,7 +57,49 @@ def build_hh_dataset(ds: Dataset) -> Dataset:
     return ds
 
 
-def collate_fn(batch, tokenizer, max_len: int) -> Dict[str, torch.Tensor]:
+def _resolve_special_tokens(tokenizer, add_bos_token, add_eos_token):
+    if add_bos_token is None:
+        add_bos_token = getattr(tokenizer, "add_bos_token", False) or tokenizer.bos_token_id is not None
+    if add_eos_token is None:
+        add_eos_token = getattr(tokenizer, "add_eos_token", False) or tokenizer.eos_token_id is not None
+    return bool(add_bos_token), bool(add_eos_token)
+
+
+def _encode_and_pad(texts, tokenizer, max_len: int, add_bos: bool, add_eos: bool):
+    bos_id = tokenizer.bos_token_id
+    eos_id = tokenizer.eos_token_id
+
+    reserved = int(add_bos and bos_id is not None) + int(add_eos and eos_id is not None)
+    trunc_len = max(1, max_len - reserved)
+
+    enc = tokenizer(
+        texts,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=trunc_len,
+    )
+    input_ids = enc["input_ids"]
+
+    if add_bos and bos_id is not None:
+        input_ids = [
+            ids if ids and ids[0] == bos_id else [bos_id] + ids
+            for ids in input_ids
+        ]
+    if add_eos and eos_id is not None:
+        input_ids = [
+            ids if ids and ids[-1] == eos_id else ids + [eos_id]
+            for ids in input_ids
+        ]
+
+    return tokenizer.pad(
+        {"input_ids": input_ids},
+        padding="max_length",
+        max_length=max_len,
+        return_tensors="pt",
+    )
+
+
+def collate_fn(batch, tokenizer, max_len: int, add_bos_token=None, add_eos_token=None) -> Dict[str, torch.Tensor]:
     """
     Input: list of triplets {prompt, chosen, rejected}
     Output:
@@ -71,6 +113,11 @@ def collate_fn(batch, tokenizer, max_len: int) -> Dict[str, torch.Tensor]:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    add_bos, add_eos = _resolve_special_tokens(tokenizer, add_bos_token, add_eos_token)
+    bos_id = tokenizer.bos_token_id
+    reserved = int(add_bos and bos_id is not None) + int(add_eos and tokenizer.eos_token_id is not None)
+    prompt_max_len = max(1, max_len - reserved)
+
     for item in batch:
         prompt = str(item["prompt"])
         chosen = str(item["chosen"])
@@ -83,34 +130,16 @@ def collate_fn(batch, tokenizer, max_len: int) -> Dict[str, torch.Tensor]:
             prompt,
             add_special_tokens=False,
             truncation=True,
-            max_length=max_len,
+            max_length=prompt_max_len,
         )["input_ids"]
-        prompt_lens.append(len(prompt_ids))
+        has_bos = bool(prompt_ids) and bos_id is not None and prompt_ids[0] == bos_id
+        bos_shift = 0 if has_bos else int(add_bos and bos_id is not None)
+        prompt_lens.append(len(prompt_ids) + bos_shift)
 
-    enc_chosen = tokenizer(
-        chosen_txt,
-        padding="max_length",
-        truncation=True,
-        max_length=max_len,
-        return_tensors="pt",
-        add_special_tokens=True,
-    )
-    enc_rejected = tokenizer(
-        rejected_txt,
-        padding="max_length",
-        truncation=True,
-        max_length=max_len,
-        return_tensors="pt",
-        add_special_tokens=True,
-    )
+    enc_chosen = _encode_and_pad(chosen_txt, tokenizer, max_len=max_len, add_bos=add_bos, add_eos=add_eos)
+    enc_rejected = _encode_and_pad(rejected_txt, tokenizer, max_len=max_len, add_bos=add_bos, add_eos=add_eos)
 
-    has_bos = (
-        tokenizer.bos_token_id is not None
-        and enc_chosen.input_ids.size(1) > 0
-        and enc_chosen.input_ids[0, 0].item() == tokenizer.bos_token_id
-    )
-    bos_shift = 1 if has_bos else 0
-    prompt_length = torch.tensor([pl + bos_shift for pl in prompt_lens], dtype=torch.long)
+    prompt_length = torch.tensor(prompt_lens, dtype=torch.long)
 
     chosen_labels = enc_chosen.input_ids.clone()
     rejected_labels = enc_rejected.input_ids.clone()
@@ -162,6 +191,8 @@ def build_train_val(config: Dict[str, Any], tokenizer):
     batch_size = int(training_cfg.get("batch_size", 1))
     num_workers = int(dataset_cfg.get("num_workers", training_cfg.get("num_workers", 0)))
     drop_last = bool(training_cfg.get("drop_last", False))
+    add_bos_token = dataset_cfg.get("add_bos_token")
+    add_eos_token = dataset_cfg.get("add_eos_token")
 
     ds = load_dataset(raw_dataset, split=split)
     ds_triple = build_hh_dataset(ds)
@@ -173,7 +204,13 @@ def build_train_val(config: Dict[str, Any], tokenizer):
         train_ds_raw = ds_triple
         val_ds_raw = ds_triple.select([])
 
-    collate = partial(collate_fn, tokenizer=tokenizer, max_len=max_len)
+    collate = partial(
+        collate_fn,
+        tokenizer=tokenizer,
+        max_len=max_len,
+        add_bos_token=add_bos_token,
+        add_eos_token=add_eos_token,
+    )
 
     train_sampler = _distributed_samplers(config, train_ds_raw, shuffle=True, seed=seed)
     val_sampler = _distributed_samplers(config, val_ds_raw, shuffle=False, seed=seed)
@@ -214,13 +251,21 @@ def build_eval_loader(config: Dict[str, Any], tokenizer):
     batch_size = int(test_cfg.get("batch_size", training_cfg.get("batch_size", 1)))
     num_workers = int(test_cfg.get("num_workers", dataset_cfg.get("num_workers", training_cfg.get("num_workers", 0))))
     limit = int(test_cfg.get("test_num", 0))
+    add_bos_token = test_cfg.get("add_bos_token", dataset_cfg.get("add_bos_token"))
+    add_eos_token = test_cfg.get("add_eos_token", dataset_cfg.get("add_eos_token"))
 
     ds = load_dataset(raw_dataset, split=split)
     ds_triple = build_hh_dataset(ds)
     if limit > 0:
         ds_triple = ds_triple.select(range(min(limit, len(ds_triple))))
 
-    collate = partial(collate_fn, tokenizer=tokenizer, max_len=max_len)
+    collate = partial(
+        collate_fn,
+        tokenizer=tokenizer,
+        max_len=max_len,
+        add_bos_token=add_bos_token,
+        add_eos_token=add_eos_token,
+    )
     eval_sampler = _distributed_samplers(config, ds_triple, shuffle=False, seed=seed)
 
     eval_loader = DataLoader(
