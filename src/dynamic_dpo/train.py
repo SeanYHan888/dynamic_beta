@@ -100,11 +100,14 @@ def build_accelerator(config: Dict[str, Any], policy, mixed_precision: str) -> A
                 raise RuntimeError(
                     "FSDP2 mixed precision requires torch.distributed.fsdp.MixedPrecisionPolicy."
                 ) from exc
-            return MixedPrecisionPolicy(
-                param_dtype=torch.bfloat16,
-                reduce_dtype=torch.bfloat16,
-                buffer_dtype=torch.bfloat16,
-            )
+            mp_kwargs = {
+                "param_dtype": torch.bfloat16,
+                "reduce_dtype": torch.bfloat16,
+                "buffer_dtype": torch.bfloat16,
+            }
+            mp_sig = inspect.signature(MixedPrecisionPolicy)
+            supported = {k: v for k, v in mp_kwargs.items() if k in mp_sig.parameters}
+            return MixedPrecisionPolicy(**supported)
         return MixedPrecision(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.bfloat16,
