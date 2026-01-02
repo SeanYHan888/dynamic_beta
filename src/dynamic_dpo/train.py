@@ -308,14 +308,16 @@ def train(config_path: str, mode: str = "dynamic"):
                 # Dynamic DPO Logic
                 beta_used = beta
                 if is_dynamic:
+                    # Sync margins for correct global statistics
+                    # We gather the margins from all GPUs so every rank calculates stats on the full global batch
+                    all_margins = accelerator.gather(model_margin)
+                    
                     if not warmup_done:
-                        threshold_accumulator.update(model_margin)
+                        threshold_accumulator.update(all_margins)
                         warmup_count += 1
                         if warmup_count >= warmup_steps:
                             tau_0 = threshold_accumulator.finalize()
-                            tau_0_tensor = torch.tensor(tau_0, device=device)
-                            if accelerator.num_processes > 1:
-                                tau_0 = accelerator.reduce(tau_0_tensor, reduction="mean").item()
+                            # Since everyone has the same all_margins history, tau_0 is identical on all ranks.
                             ema = EMAUpdate(tau_0=tau_0, q=q, momentum=momentum)
                             warmup_done = True
                             if log_f is not None:
@@ -327,21 +329,12 @@ def train(config_path: str, mode: str = "dynamic"):
                                 log_f.flush()
                         beta_used = beta_0
                     else:
-                        if accelerator.num_processes > 1:
-                            batch_tau = torch.quantile(model_margin.detach().float(), q).item()
-                            batch_tau_tensor = torch.tensor(batch_tau, device=device)
-                            batch_tau = accelerator.reduce(batch_tau_tensor, reduction="mean").item()
-                            tau = ema.update_tau_from_value(batch_tau)
-                        else:
-                            tau = ema.update_tau(model_margin)
-
-                        num_over = (model_margin >= tau).sum().float()
-                        num_total = torch.tensor(float(model_margin.numel()), device=device)
-                        if accelerator.num_processes > 1:
-                            num_over = accelerator.reduce(num_over, reduction="sum")
-                            num_total = accelerator.reduce(num_total, reduction="sum")
-                        p_hat = (num_over / num_total).item()
-                        num_margin = int(num_total.item())
+                        tau = ema.update_tau(all_margins)
+                        
+                        # Calculate p_hat exactly using the global batch
+                        num_margin = all_margins.numel()
+                        p_hat = empirical_over_threshold_proportion(all_margins, tau)
+    
                         is_over_risk, eplison, delta_prime = risk_test(
                             p_hat=p_hat,
                             eplison_0=eplison_0,
