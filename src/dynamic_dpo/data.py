@@ -219,12 +219,14 @@ def build_train_val(config, tokenizer):
         train_ds_raw,
         batch_size=batch_size,
         shuffle=True, # Accelerate handles sampler creation
+        collate_fn=ds_collate,
         pin_memory=True,
     )
     val_loader = DataLoader(
         val_ds_raw,
         batch_size=batch_size,
         shuffle=False,
+        collate_fn=ds_collate,
         pin_memory=True,
     )
 
