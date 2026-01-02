@@ -143,9 +143,9 @@ def build_accelerator(config: Dict[str, Any], policy, mixed_precision: str) -> A
         limit_all_gathers=bool(fsdp_config.get("limit_all_gathers", True)),
     )
     plugin_sig = inspect.signature(FullyShardedDataParallelPlugin)
+    actual_fsdp_version = fsdp_version if use_fsdp2 else 1
     if "fsdp_version" in plugin_sig.parameters:
         fsdp_plugin_kwargs["fsdp_version"] = fsdp_version
-        actual_fsdp_version = fsdp_version
     elif use_fsdp2:
         logger.warning(
             "FSDP2 requested but accelerate.FullyShardedDataParallelPlugin has no fsdp_version; falling back to FSDP1."
@@ -155,10 +155,25 @@ def build_accelerator(config: Dict[str, Any], policy, mixed_precision: str) -> A
             fsdp_plugin_kwargs["reshard_after_forward"] = (
                 ShardingStrategy.FULL_SHARD if reshard_after_forward else ShardingStrategy.NO_SHARD
             )
-    else:
-        actual_fsdp_version = 1
 
-    fsdp_plugin = FullyShardedDataParallelPlugin(**fsdp_plugin_kwargs)
+    try:
+        fsdp_plugin = FullyShardedDataParallelPlugin(**fsdp_plugin_kwargs)
+    except ValueError as exc:
+        msg = str(exc)
+        if use_fsdp2 and "FSDP1" in msg and "reshard_after_forward" in msg:
+            logger.warning(
+                "FSDP2 requested but plugin rejected bool reshard_after_forward; falling back to FSDP1."
+            )
+            fsdp_plugin_kwargs.pop("fsdp_version", None)
+            raf = fsdp_plugin_kwargs.get("reshard_after_forward")
+            if isinstance(raf, bool):
+                fsdp_plugin_kwargs["reshard_after_forward"] = (
+                    ShardingStrategy.FULL_SHARD if raf else ShardingStrategy.NO_SHARD
+                )
+            actual_fsdp_version = 1
+            fsdp_plugin = FullyShardedDataParallelPlugin(**fsdp_plugin_kwargs)
+        else:
+            raise
     accelerator = Accelerator(mixed_precision=mixed_precision, fsdp_plugin=fsdp_plugin)
     accelerator._fsdp_version_used = actual_fsdp_version
     return accelerator
