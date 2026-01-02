@@ -187,6 +187,21 @@ def train(config_path: str, mode: str = "dynamic"):
     mixed_precision = "bf16" if use_bf16 else "no"
     accelerator = build_accelerator(config, policy, mixed_precision=mixed_precision)
     device = accelerator.device
+    if accelerator.is_main_process:
+        logger.info(
+            "precision config=%s cuda_available=%s mixed_precision=%s accelerator_mixed_precision=%s device=%s num_processes=%s",
+            config.get("precision"),
+            torch.cuda.is_available(),
+            mixed_precision,
+            accelerator.mixed_precision,
+            device,
+            accelerator.num_processes,
+        )
+        logger.info(
+            "CUDA_VISIBLE_DEVICES=%s torch.cuda.device_count=%s",
+            os.environ.get("CUDA_VISIBLE_DEVICES"),
+            torch.cuda.device_count(),
+        )
 
     seed = config['dataset'].get('seed', 42)
     seed_everything(seed + accelerator.process_index)
@@ -214,6 +229,15 @@ def train(config_path: str, mode: str = "dynamic"):
     ref_model.to(device)
     policy.train()
     ref_model.eval()
+    if accelerator.is_main_process:
+        policy_dtype = next(policy.parameters()).dtype
+        ref_dtype = next(ref_model.parameters()).dtype
+        logger.info(
+            "policy_param_dtype=%s ref_param_dtype=%s (autocast=%s)",
+            policy_dtype,
+            ref_dtype,
+            accelerator.mixed_precision,
+        )
 
     # Logging setup
     # Determine log dir based on mode or config
@@ -313,7 +337,8 @@ def train(config_path: str, mode: str = "dynamic"):
             disable=not accelerator.is_main_process,
         )
         
-        running_loss = 0.0
+        running_loss_sum = torch.tensor(0.0, device=device)
+        running_loss_count = torch.tensor(0.0, device=device)
         
         for step, batch in pbar:
             batch = to_device_batch(batch, device)
@@ -440,19 +465,25 @@ def train(config_path: str, mode: str = "dynamic"):
             optimizer.step()
             
             global_steps += 1 
-            running_loss += loss.item()
+            running_loss_sum += loss_raw.detach().sum()
+            running_loss_count += loss_raw.new_tensor(loss_raw.numel())
             
-            if accelerator.is_main_process and (step + 1) % log_steps == 0:
-                avg_loss = running_loss / log_steps
-                pbar.set_postfix(loss=f"{avg_loss:.3f}")
-                wandb.log({
-                    'loss': avg_loss,
-                    'chosen_rewards': avg_chosen_rewards.item(),
-                    'rejected_rewards': avg_rejected_rewards.item(),
-                    'model_margin': avg_model_margin.item(),
-                    'beta': beta_used
-                })
-                running_loss = 0.0
+            if (step + 1) % log_steps == 0:
+                global_loss_sum = accelerator.reduce(running_loss_sum, reduction="sum")
+                global_loss_count = accelerator.reduce(running_loss_count, reduction="sum")
+                if accelerator.is_main_process:
+                    denom = max(global_loss_count.item(), 1.0)
+                    avg_loss = global_loss_sum.item() / denom
+                    pbar.set_postfix(loss=f"{avg_loss:.3f}")
+                    wandb.log({
+                        'loss': avg_loss,
+                        'chosen_rewards': avg_chosen_rewards.item(),
+                        'rejected_rewards': avg_rejected_rewards.item(),
+                        'model_margin': avg_model_margin.item(),
+                        'beta': beta_used
+                    })
+                running_loss_sum.zero_()
+                running_loss_count.zero_()
 
         eval_metrics = evaluate(policy, ref_model, val_loader, beta=beta_used, accelerator=accelerator)
         if accelerator.is_main_process:
