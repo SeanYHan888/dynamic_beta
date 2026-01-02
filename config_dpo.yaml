@@ -60,8 +60,9 @@ debug:
 
 fsdp:
   enabled: true
-  auto_wrap_layers: ["LlamaDecoderLayer"]
-  limit_all_gathers: false
+  version: 2
+  reshard_after_forward: true
+
 
 
 

@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import json
 import logging
 import os
@@ -16,7 +17,6 @@ try:
 except ImportError:
     from accelerate import FullyShardedDataParallelPlugin
 from torch.distributed.fsdp import FullStateDictConfig, MixedPrecision, ShardingStrategy, StateDictType
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.optim import AdamW
 from tqdm import tqdm
@@ -73,12 +73,19 @@ def build_accelerator(config: Dict[str, Any], policy, mixed_precision: str) -> A
 
     auto_wrap_policy = None
     layer_cls_names = fsdp_config.get("auto_wrap_layers", [])
+    if isinstance(layer_cls_names, str):
+        layer_cls_names = [name.strip() for name in layer_cls_names.split(",") if name.strip()]
+    elif layer_cls_names is None:
+        layer_cls_names = []
     if layer_cls_names:
         layer_classes = resolve_fsdp_layer_classes(policy, layer_cls_names)
         if layer_classes:
             auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls=layer_classes)
         else:
-            logger.warning("FSDP auto_wrap_layers not found in model; wrapping full model.")
+            logger.warning(
+                "FSDP auto_wrap_layers not found in model; wrapping full model. auto_wrap_layers=%s",
+                layer_cls_names,
+            )
 
     mp_policy = None
     if mixed_precision == "bf16":
@@ -88,8 +95,46 @@ def build_accelerator(config: Dict[str, Any], policy, mixed_precision: str) -> A
             buffer_dtype=torch.bfloat16,
         )
 
-    reshard_after_forward = bool(fsdp_config.get("reshard_after_forward", True))
-    fsdp_plugin = FullyShardedDataParallelPlugin(
+    fsdp_version = int(fsdp_config.get("version", fsdp_config.get("fsdp_version", 2)))
+    use_fsdp2 = fsdp_version == 2
+
+    reshard_cfg = fsdp_config.get("reshard_after_forward", None)
+    if use_fsdp2:
+        if reshard_cfg is None:
+            reshard_after_forward = True
+        elif isinstance(reshard_cfg, bool):
+            reshard_after_forward = reshard_cfg
+        elif isinstance(reshard_cfg, str):
+            key = reshard_cfg.strip().lower()
+            if key in ("true", "1", "yes", "full_shard", "full"):
+                reshard_after_forward = True
+            elif key in ("false", "0", "no", "no_shard", "none"):
+                reshard_after_forward = False
+            else:
+                raise ValueError(f"Unsupported fsdp.reshard_after_forward value: {reshard_cfg!r}")
+        else:
+            raise ValueError(f"Unsupported fsdp.reshard_after_forward type: {type(reshard_cfg).__name__}")
+    else:
+        if reshard_cfg is None:
+            reshard_after_forward = ShardingStrategy.FULL_SHARD
+        elif isinstance(reshard_cfg, ShardingStrategy):
+            reshard_after_forward = reshard_cfg
+        elif isinstance(reshard_cfg, str):
+            key = reshard_cfg.strip().lower()
+            if key in ("full_shard", "full", "fsdp", "true"):
+                reshard_after_forward = ShardingStrategy.FULL_SHARD
+            elif key in ("shard_grad_op", "shard_grad", "grad", "hybrid"):
+                reshard_after_forward = ShardingStrategy.SHARD_GRAD_OP
+            elif key in ("no_shard", "none", "false"):
+                reshard_after_forward = ShardingStrategy.NO_SHARD
+            else:
+                raise ValueError(f"Unsupported fsdp.reshard_after_forward value: {reshard_cfg!r}")
+        elif isinstance(reshard_cfg, bool):
+            reshard_after_forward = ShardingStrategy.FULL_SHARD if reshard_cfg else ShardingStrategy.NO_SHARD
+        else:
+            raise ValueError(f"Unsupported fsdp.reshard_after_forward type: {type(reshard_cfg).__name__}")
+
+    fsdp_plugin_kwargs = dict(
         reshard_after_forward=reshard_after_forward,
         auto_wrap_policy=auto_wrap_policy,
         mixed_precision_policy=mp_policy,
@@ -97,7 +142,26 @@ def build_accelerator(config: Dict[str, Any], policy, mixed_precision: str) -> A
         state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
         limit_all_gathers=bool(fsdp_config.get("limit_all_gathers", True)),
     )
-    return Accelerator(mixed_precision=mixed_precision, fsdp_plugin=fsdp_plugin)
+    plugin_sig = inspect.signature(FullyShardedDataParallelPlugin)
+    if "fsdp_version" in plugin_sig.parameters:
+        fsdp_plugin_kwargs["fsdp_version"] = fsdp_version
+        actual_fsdp_version = fsdp_version
+    elif use_fsdp2:
+        logger.warning(
+            "FSDP2 requested but accelerate.FullyShardedDataParallelPlugin has no fsdp_version; falling back to FSDP1."
+        )
+        actual_fsdp_version = 1
+        if isinstance(reshard_after_forward, bool):
+            fsdp_plugin_kwargs["reshard_after_forward"] = (
+                ShardingStrategy.FULL_SHARD if reshard_after_forward else ShardingStrategy.NO_SHARD
+            )
+    else:
+        actual_fsdp_version = 1
+
+    fsdp_plugin = FullyShardedDataParallelPlugin(**fsdp_plugin_kwargs)
+    accelerator = Accelerator(mixed_precision=mixed_precision, fsdp_plugin=fsdp_plugin)
+    accelerator._fsdp_version_used = actual_fsdp_version
+    return accelerator
 
 @torch.no_grad()
 def evaluate(policy, ref_model, val_loader, beta, accelerator):
@@ -202,6 +266,13 @@ def train(config_path: str, mode: str = "dynamic"):
             "CUDA_VISIBLE_DEVICES=%s torch.cuda.device_count=%s",
             os.environ.get("CUDA_VISIBLE_DEVICES"),
             torch.cuda.device_count(),
+        )
+        fsdp_cfg = config.get("fsdp", {})
+        logger.info(
+            "fsdp_enabled=%s fsdp_version_config=%s fsdp_version_used=%s",
+            fsdp_cfg.get("enabled", False),
+            fsdp_cfg.get("version", fsdp_cfg.get("fsdp_version")),
+            getattr(accelerator, "_fsdp_version_used", None),
         )
 
     seed = config['dataset'].get('seed', 42)
@@ -459,10 +530,7 @@ def train(config_path: str, mode: str = "dynamic"):
             optimizer.zero_grad()
             accelerator.backward(loss)
 
-            if isinstance(policy, FSDP):
-                FSDP.clip_grad_norm_(policy, max_norm=max_grad_norm)
-            else:
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=max_grad_norm)
+            accelerator.clip_grad_norm_(policy.parameters(), max_norm=max_grad_norm)
             optimizer.step()
             
             global_steps += 1 
