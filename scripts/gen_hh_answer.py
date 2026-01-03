@@ -1,13 +1,21 @@
+import os
+import sys
+import json
+import random
+import argparse
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
-from dataset_process_hh import split_prompt_and_response
-import os
-import json
-import random
 import yaml
 from tqdm import tqdm
-import argparse
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SRC_DIR = os.path.join(ROOT_DIR, "src")
+if SRC_DIR not in sys.path:
+    sys.path.append(SRC_DIR)
+
+from dynamic_dpo.data import split_prompt_and_response
 
 # load yaml config
 def load_yaml_config(path):
