@@ -4,7 +4,7 @@ import numpy as np
 import math
 import os
 import json
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, Optional
 
 # --- Log Probability Calculation ---
 
@@ -182,7 +182,6 @@ class EMAUpdate:
         self.tau = (1.0 - self.lam) * self.tau + self.lam * batch_tau
         return self.tau
 
-    # Unused method removed
 
 def empirical_over_threshold_proportion(margins: torch.Tensor, threshold):
     return (margins >= threshold).float().mean().item()
@@ -198,6 +197,46 @@ def update_beta(beta, p_hat, delta_prime, eplison, alpha, gamma, beta_min, beta_
     beta_new = beta * math.exp(alpha * s_k)
     beta_new = max(beta_min, min(beta_new, beta_max))
     return beta_new, u_k, s_k, alpha
+
+
+def save_hf_pretrained_from_fsdp_shards(
+    checkpoint_dir: str,
+    output_dir: str,
+    safe_serialization: bool = True,
+    max_shard_size: str = "10GB",
+    logger: Optional[Any] = None,
+) -> Optional[str]:
+    """
+    Merge FSDP sharded checkpoints into HF-style `save_pretrained` output.
+    """
+    try:
+        from accelerate.utils import merge_fsdp_weights
+    except Exception as exc:
+        msg = f"merge_fsdp_weights unavailable; skipping HF save. error={exc}"
+        if logger is not None:
+            logger.warning(msg)
+        else:
+            print(msg)
+        return None
+
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        merge_fsdp_weights(
+            checkpoint_dir,
+            output_dir,
+            safe_serialization=safe_serialization,
+            max_shard_size=max_shard_size,
+        )
+    except TypeError:
+        try:
+            merge_fsdp_weights(
+                checkpoint_dir,
+                output_dir,
+                safe_serialization=safe_serialization,
+            )
+        except TypeError:
+            merge_fsdp_weights(checkpoint_dir, output_dir)
+    return output_dir
 
 
 # --- Debug Utilities ---
