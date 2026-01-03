@@ -2,6 +2,11 @@ policy_name: meta-llama/Llama-3.2-1B
 ref_name: meta-llama/Llama-3.2-1B
 precision: bf16
 
+fsdp:
+  enabled: true
+  state_dict_offload: true
+  save_on_rank0_only: true
+
 dataset:
   dataset_name: Anthropic/hh-rlhf
   subset: train[:20%]

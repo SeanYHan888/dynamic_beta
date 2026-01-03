@@ -138,10 +138,23 @@ def train(config_path: str, mode: str = "dynamic"):
     config = load_yaml_config(config_path)
     use_bf16 = config['precision'] == 'bf16'
 
-    fsdp_plugin = FullyShardedDataParallelPlugin(
-        state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-        optim_state_dict_config=FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
-    )
+    fsdp_cfg = config.get('fsdp', {})
+    fsdp_enabled = bool(fsdp_cfg.get('enabled', True))
+    fsdp_state_offload = bool(fsdp_cfg.get('state_dict_offload', True))
+    fsdp_rank0_only = bool(fsdp_cfg.get('save_on_rank0_only', True))
+
+    fsdp_plugin = None
+    if fsdp_enabled:
+        fsdp_plugin = FullyShardedDataParallelPlugin(
+            state_dict_config=FullStateDictConfig(
+                offload_to_cpu=fsdp_state_offload,
+                rank0_only=fsdp_rank0_only
+            ),
+            optim_state_dict_config=FullOptimStateDictConfig(
+                offload_to_cpu=fsdp_state_offload,
+                rank0_only=fsdp_rank0_only
+            ),
+        )
     accelerator = Accelerator(
         fsdp_plugin=fsdp_plugin,
         mixed_precision="bf16" if use_bf16 else "no",
