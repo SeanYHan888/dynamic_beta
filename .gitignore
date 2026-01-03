@@ -9,3 +9,7 @@ logs/
 dpo_model/
 dynamic_dpo_model/
 .venv/
+risk_test_and_beta_log.jsonl
+checkpoints/
+archive/Experiment1/
+hf_*/
