@@ -62,7 +62,7 @@ def initial_distribution():
     device = torch.device("cuda", local_rank)
     return device, rank, world_size, local_rank
 
-
+# gather 1d tensor from all ranks
 def gather_1d_tensor(x: torch.Tensor, world_size: int) -> torch.Tensor:
     """
     x: (bs,) on current rank GPU
