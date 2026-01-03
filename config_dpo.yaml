@@ -33,6 +33,7 @@ test:
   dpo_out_dir: eval_outputs/dpo_out.jsonl
   dynamic_dpo_out_dir: eval_outputs/dynamic_dpo_out.jsonl
   ref_out_dir: eval_outputs/ref_out.jsonl
+  load_model_dir: dynamic_dpo_model/hf_pretrained
 
 risk_test:
   delta: 0.1

@@ -74,7 +74,7 @@ def main():
 
     # load policy and reference
     policy1_path = config['dpo_training']['save_dpo_dir']
-    policy2_path = config['dpo_training']['save_dir']
+    policy2_path = config['test']['load_model_dir']
     ref_name = config['ref_name']
 
     tok = AutoTokenizer.from_pretrained(ref_name)
