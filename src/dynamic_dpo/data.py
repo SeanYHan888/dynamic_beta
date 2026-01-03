@@ -99,6 +99,24 @@ def collate_fn(batch, tokenizer, max_len, truncate_prompt=False):
         # decoder-only models often have no pad token; reuse eos as pad for batching
         tokenizer.pad_token = tokenizer.eos_token
 
+    def ensure_eos_token(input_ids: torch.Tensor, attention_mask: torch.Tensor) -> None:
+        eos_id = tokenizer.eos_token_id
+        if eos_id is None:
+            return
+        seq_len = input_ids.size(1)
+        lengths = attention_mask.sum(dim=1).tolist()
+        for i, length in enumerate(lengths):
+            if length <= 0:
+                continue
+            last_idx = min(length - 1, seq_len - 1)
+            if input_ids[i, last_idx].item() == eos_id:
+                continue
+            if length < seq_len:
+                input_ids[i, length] = eos_id
+                attention_mask[i, length] = 1
+            else:
+                input_ids[i, last_idx] = eos_id
+
     if truncate_prompt:
         chosen_input_ids_list = []
         rejected_input_ids_list = []
@@ -107,9 +125,8 @@ def collate_fn(batch, tokenizer, max_len, truncate_prompt=False):
         prompt_lens = []
 
         add_bos = bool(getattr(tokenizer, "add_bos_token", False)) and tokenizer.bos_token_id is not None
-        add_eos = bool(getattr(tokenizer, "add_eos_token", False)) and tokenizer.eos_token_id is not None
         bos = [tokenizer.bos_token_id] if add_bos else []
-        eos = [tokenizer.eos_token_id] if add_eos else []
+        eos = [tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else []
 
         for item in batch:
             prompt = str(item["prompt"])
@@ -210,6 +227,8 @@ def collate_fn(batch, tokenizer, max_len, truncate_prompt=False):
         enc_chosen_attention_mask = enc_chosen.attention_mask
         enc_rejected_input_ids = enc_rejected.input_ids
         enc_rejected_attention_mask = enc_rejected.attention_mask
+        ensure_eos_token(enc_chosen_input_ids, enc_chosen_attention_mask)
+        ensure_eos_token(enc_rejected_input_ids, enc_rejected_attention_mask)
 
     # Build labels: input_ids with prompt tokens masked to -100
     chosen_labels = enc_chosen_input_ids.clone()
@@ -293,7 +312,6 @@ def build_train_val(config, tokenizer):
 
     # Return None for samplers as they are now handled implicitly or internally
     return train_loader, val_loader, None, None
-
 
 
 

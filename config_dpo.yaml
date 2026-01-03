@@ -10,7 +10,7 @@ dataset:
   seed: 42
   max_len: 512
   min_response_tokens: 32
-  truncate_prompt: false
+  truncate_prompt: true
   
 dpo_training:
   epochs: 1
