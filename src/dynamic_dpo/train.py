@@ -66,10 +66,18 @@ def build_accelerator(config: Dict[str, Any], policy, mixed_precision: str) -> A
     fsdp_config = config.get("fsdp", {})
     fsdp_enabled = bool(fsdp_config.get("enabled", False))
     if not fsdp_enabled:
-        return Accelerator(mixed_precision=mixed_precision)
+        accel_sig = inspect.signature(Accelerator)
+        accel_kwargs = {"mixed_precision": mixed_precision}
+        if "even_batches" in accel_sig.parameters:
+            accel_kwargs["even_batches"] = True
+        return Accelerator(**accel_kwargs)
     if not torch.cuda.is_available():
         logger.warning("FSDP enabled but CUDA is not available. Disabling FSDP.")
-        return Accelerator(mixed_precision=mixed_precision)
+        accel_sig = inspect.signature(Accelerator)
+        accel_kwargs = {"mixed_precision": mixed_precision}
+        if "even_batches" in accel_sig.parameters:
+            accel_kwargs["even_batches"] = True
+        return Accelerator(**accel_kwargs)
 
     auto_wrap_policy = None
     layer_cls_names = fsdp_config.get("auto_wrap_layers", [])
@@ -158,7 +166,7 @@ def build_accelerator(config: Dict[str, Any], policy, mixed_precision: str) -> A
         mixed_precision_policy=mp_policy,
         state_dict_type=StateDictType.FULL_STATE_DICT,
         state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-        limit_all_gathers=bool(fsdp_config.get("limit_all_gathers", True)),
+        limit_all_gathers=bool(fsdp_config.get("limit_all_gathers", False)),
     )
     plugin_sig = inspect.signature(FullyShardedDataParallelPlugin)
     actual_fsdp_version = fsdp_version if use_fsdp2 else 1
@@ -194,7 +202,11 @@ def build_accelerator(config: Dict[str, Any], policy, mixed_precision: str) -> A
             fsdp_plugin = FullyShardedDataParallelPlugin(**fsdp_plugin_kwargs)
         else:
             raise
-    accelerator = Accelerator(mixed_precision=mixed_precision, fsdp_plugin=fsdp_plugin)
+    accel_sig = inspect.signature(Accelerator)
+    accel_kwargs = {"mixed_precision": mixed_precision, "fsdp_plugin": fsdp_plugin}
+    if "even_batches" in accel_sig.parameters:
+        accel_kwargs["even_batches"] = True
+    accelerator = Accelerator(**accel_kwargs)
     accelerator._fsdp_version_used = actual_fsdp_version
     return accelerator
 
