@@ -260,14 +260,46 @@ def save_fsdp_sharded_checkpoint(
 
     os.makedirs(output_dir, exist_ok=True)
     try:
-        save_fsdp_model(accelerator, model, output_dir)
-    except Exception as exc:
-        msg = f"save_fsdp_model failed; skipping FSDP shard save. error={exc}"
-        if logger is not None:
-            logger.warning(msg)
+        sig = inspect.signature(save_fsdp_model)
+    except (TypeError, ValueError):
+        sig = None
+
+    try:
+        if sig is not None:
+            params = list(sig.parameters.keys())
+            kwargs: Dict[str, Any] = {}
+            if "accelerator" in params:
+                kwargs["accelerator"] = accelerator
+            if "model" in params:
+                kwargs["model"] = model
+            elif "fsdp_model" in params:
+                kwargs["fsdp_model"] = model
+            if "output_dir" in params:
+                kwargs["output_dir"] = output_dir
+            elif "output_path" in params:
+                kwargs["output_path"] = output_dir
+            elif "output_folder" in params:
+                kwargs["output_folder"] = output_dir
+
+            if kwargs:
+                save_fsdp_model(**kwargs)
+            else:
+                raise TypeError("save_fsdp_model signature not recognized.")
         else:
-            print(msg)
-        return None
+            raise TypeError("save_fsdp_model signature unavailable.")
+    except Exception:
+        try:
+            save_fsdp_model(accelerator, model, output_dir)
+        except Exception:
+            try:
+                save_fsdp_model(model, output_dir)
+            except Exception as exc:
+                msg = f"save_fsdp_model failed; skipping FSDP shard save. error={exc}"
+                if logger is not None:
+                    logger.warning(msg)
+                else:
+                    print(msg)
+                return None
     return output_dir
 
 
