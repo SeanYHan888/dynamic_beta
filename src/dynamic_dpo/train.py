@@ -330,9 +330,15 @@ def train(config_path: str, mode: str = "dynamic"):
 
     if use_bf16:
         ref_model.to(dtype=torch.bfloat16)
-    policy, ref_model, optimizer, train_loader, val_loader = accelerator.prepare(
-        policy, ref_model, optimizer, train_loader, val_loader
-    )
+    if getattr(accelerator, "_fsdp_version_used", None) == 2:
+        policy, optimizer, train_loader, val_loader = accelerator.prepare(
+            policy, optimizer, train_loader, val_loader
+        )
+        ref_model.to(device)
+    else:
+        policy, ref_model, optimizer, train_loader, val_loader = accelerator.prepare(
+            policy, ref_model, optimizer, train_loader, val_loader
+        )
     policy.train()
     ref_model.eval()
     if accelerator.is_main_process:
