@@ -680,7 +680,8 @@ def train(config_path: str, mode: str = "dynamic"):
 # Save final model， save sharded if configured, else save as all-gathered. 
 # If sharded save, also merge to HF format.
     save_dir = config['dpo_training'].get('save_dir', 'dpo_model')
-    save_sharded = bool(config.get("fsdp", {}).get("save_sharded", False))
+    fsdp_enabled = bool(config.get("fsdp", {}).get("enabled", False))
+    save_sharded = fsdp_enabled and bool(config.get("fsdp", {}).get("save_sharded", False))
     if accelerator.is_main_process:
         logger.info("[save] starting save to %s", save_dir)
     accelerator.wait_for_everyone()
@@ -728,7 +729,9 @@ def train(config_path: str, mode: str = "dynamic"):
             logger.warning("[save] rank0 no FSDP shards available; skipping HF merge")
     else:
         # Non-sharded save, might use large memory
-        use_fsdp2 = getattr(accelerator, "is_fsdp2", False) or getattr(accelerator, "_fsdp_version_used", None) == 2
+        use_fsdp2 = fsdp_enabled and (
+            getattr(accelerator, "is_fsdp2", False) or getattr(accelerator, "_fsdp_version_used", None) == 2
+        )
         if use_fsdp2:
             logger.info("[save] rank=%s gathering FSDP2 full state dict", accelerator.process_index)
             state_dict = get_fsdp2_full_state_dict(policy, logger=logger)
@@ -740,10 +743,14 @@ def train(config_path: str, mode: str = "dynamic"):
             state_dict = accelerator.get_state_dict(policy)
         logger.info("[save] rank=%s state dict gathered", accelerator.process_index)
         if accelerator.is_main_process:
+            target_dir = save_dir
+            if not fsdp_enabled:
+                target_dir = os.path.join(save_dir, "ddp")
+                logger.info("[save] rank0 using DDP save dir %s", target_dir)
             unwrapped = accelerator.unwrap_model(policy)
-            unwrapped.save_pretrained(save_dir, state_dict=state_dict)
-            save_hf_artifacts(unwrapped, tok, save_dir, logger=logger)
-            logger.info("[save] rank0 saved model to %s", save_dir)
+            unwrapped.save_pretrained(target_dir, state_dict=state_dict)
+            save_hf_artifacts(unwrapped, tok, target_dir, logger=logger)
+            logger.info("[save] rank0 saved model to %s", target_dir)
 
     accelerator.end_training()
 
