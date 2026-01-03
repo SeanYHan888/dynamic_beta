@@ -4,7 +4,7 @@ import numpy as np
 import math
 import os
 import json
-from typing import Tuple, Dict
+from typing import Tuple, Dict, Callable, Any, Optional
 
 # --- Log Probability Calculation ---
 
@@ -193,3 +193,28 @@ def update_beta(beta, p_hat, delta_prime, eplison, alpha, gamma, beta_min, beta_
     beta_new = beta * math.exp(alpha * s_k)
     beta_new = max(beta_min, min(beta_new, beta_max))
     return beta_new, u_k, s_k, alpha
+
+def gather_global_margins_and_broadcast_scalars(
+    accelerator,
+    local_margins: torch.Tensor,
+    compute_fn: Callable[[torch.Tensor], Dict[str, Any]],
+) -> Tuple[torch.Tensor, float, float, Optional[Dict[str, Any]]]:
+    global_margins = accelerator.gather_for_metrics(local_margins)
+    result: Optional[Dict[str, Any]] = None
+    if accelerator.is_main_process:
+        result = compute_fn(global_margins)
+        tau = float(result["tau"])
+        beta = float(result["beta"])
+    else:
+        tau = 0.0
+        beta = 0.0
+    tau_tensor = torch.tensor([tau], device=global_margins.device)
+    beta_tensor = torch.tensor([beta], device=global_margins.device)
+    if (
+        accelerator.num_processes > 1
+        and torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    ):
+        torch.distributed.broadcast(tau_tensor, src=0)
+        torch.distributed.broadcast(beta_tensor, src=0)
+    return global_margins, tau_tensor.item(), beta_tensor.item(), result

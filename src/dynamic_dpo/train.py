@@ -1,10 +1,13 @@
 import torch
+import torch.distributed as dist
 from torch.optim import AdamW
 import argparse
 import numpy as np
 import yaml
 from tqdm import tqdm
 import random
+from accelerate import Accelerator, FullyShardedDataParallelPlugin
+from torch.distributed.fsdp import FullStateDictConfig, FullOptimStateDictConfig
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import wandb
 import os
@@ -24,6 +27,7 @@ try:
         update_beta,
         WarmupQuantileAccumulator,
         EMAUpdate,
+        gather_global_margins_and_broadcast_scalars,
     )
 except ImportError:  # Allows running as a script: uv run src/dynamic_dpo/train.py
     import os
@@ -44,6 +48,7 @@ except ImportError:  # Allows running as a script: uv run src/dynamic_dpo/train.
         update_beta,
         WarmupQuantileAccumulator,
         EMAUpdate,
+        gather_global_margins_and_broadcast_scalars,
     )
 
 logging.basicConfig(level=logging.INFO)
@@ -64,7 +69,8 @@ def seed_everything(seed: int = 42):
     torch.backends.cudnn.deterministic = True
 
 @torch.no_grad()
-def evaluate(policy, ref_model, val_loader, beta, device):
+def evaluate(policy, ref_model, val_loader, beta, accelerator):
+    device = accelerator.device
     policy_was_training = policy.training
     policy.eval()
     ref_model.eval()
@@ -75,7 +81,13 @@ def evaluate(policy, ref_model, val_loader, beta, device):
     sum_rejected_rewards = 0.0
     correct = 0  
 
-    pbar = tqdm(val_loader, desc="Evaluating", leave=False, dynamic_ncols=True)
+    pbar = tqdm(
+        val_loader,
+        desc="Evaluating",
+        leave=False,
+        dynamic_ncols=True,
+        disable=not accelerator.is_main_process,
+    )
 
     for batch in pbar:
         batch = to_device_batch(batch, device)
@@ -99,11 +111,21 @@ def evaluate(policy, ref_model, val_loader, beta, device):
         sum_rejected_rewards += rejected_rewards.mean().item() * batches
         correct += (chosen_rewards > rejected_rewards).sum().item()
         
+    totals = torch.tensor(
+        [total_loss, total_count, sum_chosen_rewards, sum_rejected_rewards, correct],
+        device=device,
+        dtype=torch.float64,
+    )
+    if dist.is_available() and dist.is_initialized() and accelerator.num_processes > 1:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+
+    total_loss, total_count, sum_chosen_rewards, sum_rejected_rewards, correct = totals.tolist()
+    denom = max(1.0, total_count)
     metrics = {
-        "eval_loss": total_loss / max(1, total_count),
-        "eval_chosen_rewards": sum_chosen_rewards / max(1, total_count),
-        "eval_rejected_rewards": sum_rejected_rewards / max(1, total_count),
-        "eval_reward_accuracy": correct / max(1, total_count),
+        "eval_loss": total_loss / denom,
+        "eval_chosen_rewards": sum_chosen_rewards / denom,
+        "eval_rejected_rewards": sum_rejected_rewards / denom,
+        "eval_reward_accuracy": correct / denom,
     }
             
     if policy_was_training:
@@ -117,20 +139,32 @@ def train(config_path: str, mode: str = "dynamic"):
     mode: 'dynamic' or 'static'
     """
     config = load_yaml_config(config_path)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
+    use_bf16 = config['precision'] == 'bf16'
+
+    fsdp_plugin = FullyShardedDataParallelPlugin(
+        state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+        optim_state_dict_config=FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
+    )
+    accelerator = Accelerator(
+        fsdp_plugin=fsdp_plugin,
+        mixed_precision="bf16" if use_bf16 else "no",
+    )
+    device = accelerator.device
+
     seed_everything(config['dataset'].get('seed', 42))
 
-    wandb.init(
-        project=config.get('wandb_project', 'handwritten-dpo'),
-        name=config.get('run_name', 'run'),
-        config=config
-    )
+    if accelerator.is_main_process:
+        wandb.init(
+            project=config.get('wandb_project', 'handwritten-dpo'),
+            name=config.get('run_name', 'run'),
+            config=config
+        )
+    accelerator.wait_for_everyone()
 
     # Load models
     policy_name = config['policy_name']
     ref_name = config['ref_name']
-    policy = AutoModelForCausalLM.from_pretrained(policy_name).to(device)
+    policy = AutoModelForCausalLM.from_pretrained(policy_name)
     tok = AutoTokenizer.from_pretrained(policy_name)
     policy.config.pad_token_id = tok.pad_token_id
 
@@ -139,21 +173,24 @@ def train(config_path: str, mode: str = "dynamic"):
         tok.pad_token = tok.eos_token
         tok.pad_token_id = tok.eos_token_id
 
-    ref_model = AutoModelForCausalLM.from_pretrained(ref_name).to(device)
+    ref_model = AutoModelForCausalLM.from_pretrained(ref_name)
     ref_model.config.pad_token_id = tok.pad_token_id
     ref_model.requires_grad_(False)
     
-    train_loader, val_loader = build_train_val(config=config, tokenizer=tok)
-
-    policy.train()
-    ref_model.eval()
-
     optimizer = AdamW(params=policy.parameters(), lr=float(config['dpo_training']['learning_rate']))
 
-    use_bf16 = config['precision'] == 'bf16'
     if use_bf16:
         policy.to(dtype=torch.bfloat16)
         ref_model.to(dtype=torch.bfloat16)
+
+    train_loader, val_loader = build_train_val(config=config, tokenizer=tok)
+    policy, optimizer, train_loader, val_loader = accelerator.prepare(
+        policy, optimizer, train_loader, val_loader
+    )
+    ref_model.to(device)
+
+    policy.train()
+    ref_model.eval()
 
     # Logging setup
     # Determine log dir based on mode or config
@@ -162,7 +199,9 @@ def train(config_path: str, mode: str = "dynamic"):
     else:
          LOG_DIR = config['margin_log'].get('dpo_log_dir', 'logs/dpo_margins')
          
-    os.makedirs(LOG_DIR, exist_ok=True)
+    if accelerator.is_main_process:
+        os.makedirs(LOG_DIR, exist_ok=True)
+    accelerator.wait_for_everyone()
     JSONL_PATH = os.path.join(LOG_DIR, "margins_log.jsonl")
 
     # Dynamic DPO specific setup
@@ -187,9 +226,12 @@ def train(config_path: str, mode: str = "dynamic"):
         beta = beta_0 # start with beta_0
         
         risk_stat = {"total": 0, "fail": 0}
-        log_f = open("risk_test_and_beta_log.jsonl", "w", encoding="utf-8")
-        warmup_steps = int(config['dpo_training']['warmup_steps'])
-        warmup_done = False
+        log_f = None
+        if accelerator.is_main_process:
+            log_f = open("risk_test_and_beta_log.jsonl", "w", encoding="utf-8")
+        warmup_steps = max(0, int(config['dpo_training']['warmup_steps']))
+        warmup_done = warmup_steps == 0
+        needs_ema_init = warmup_steps == 0
         warmup_count = 0
         ema = None
     else:
@@ -204,16 +246,24 @@ def train(config_path: str, mode: str = "dynamic"):
 
     for epoch in range(epochs):
         epoch_dir = os.path.join(LOG_DIR, f"epoch_{epoch:03d}")
-        os.makedirs(epoch_dir, exist_ok=True)
+        if accelerator.is_main_process:
+            os.makedirs(epoch_dir, exist_ok=True)
 
-        pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"train | epoch {epoch+1}/{epochs}", dynamic_ncols=True, leave=False)
+        pbar = tqdm(
+            enumerate(train_loader),
+            total=len(train_loader),
+            desc=f"train | epoch {epoch+1}/{epochs}",
+            dynamic_ncols=True,
+            leave=False,
+            disable=not accelerator.is_main_process,
+        )
         
         running_loss = 0.0
         
         for step, batch in pbar:
             batch = to_device_batch(batch, device)
 
-            with torch.cuda.amp.autocast(enabled=use_bf16, dtype=torch.bfloat16): 
+            with accelerator.autocast():
                 policy_chosen_log_prob, policy_rejected_log_prob, ref_chosen_log_prob, ref_rejected_log_prob = compute_batch_log_prob(
                     batch, policy=policy, ref_model=ref_model
                 )
@@ -224,51 +274,102 @@ def train(config_path: str, mode: str = "dynamic"):
 
                 # Dynamic DPO Logic
                 beta_used = beta
+                global_margins = None
                 if is_dynamic:
+                    local_margins = model_margin.detach().float().view(-1)
                     if not warmup_done:
-                        threshold_accumulator.update(model_margin)
+                        global_margins = accelerator.gather_for_metrics(local_margins)
+                        if accelerator.is_main_process:
+                            threshold_accumulator.update(global_margins)
                         warmup_count += 1
                         if warmup_count == warmup_steps:
-                            tau_0 = threshold_accumulator.finalize()
-                            ema = EMAUpdate(tau_0=tau_0, q=q, momentum=momentum)
+                            if accelerator.is_main_process:
+                                tau_0 = threshold_accumulator.finalize()
+                                ema = EMAUpdate(tau_0=tau_0, q=q, momentum=momentum)
+                                if log_f is not None:
+                                    log_f.write(json.dumps({
+                                        "type": "warmup_end",
+                                        "tau_0": float(tau_0),
+                                        "beta_0": float(beta)
+                                    }) + "\n")
+                                    log_f.flush()
                             warmup_done = True
-                            log_f.write(json.dumps({
-                                "type": "warmup_end",
-                                "tau_0": float(tau_0),
-                                "beta_0": float(beta)
-                            }) + "\n")
-                            log_f.flush()
+                            needs_ema_init = False
                         beta_used = beta_0
                     else:
-                        tau = ema.update_tau(model_margin)
-                        num_margin = int(model_margin.numel())
-                        p_hat = empirical_over_threshold_proportion(model_margin, tau)
-                        is_over_risk, eplison, delta_prime = risk_test(p_hat=p_hat, eplison_0=eplison_0, delta=delta, n=num_margin)
+                        def compute_from_global(global_margins):
+                            nonlocal beta, ema, needs_ema_init
+                            gm = global_margins.detach().float().view(-1)
+                            if needs_ema_init:
+                                tau_0 = torch.quantile(gm, q).item()
+                                ema = EMAUpdate(tau_0=tau_0, q=q, momentum=momentum)
+                                if log_f is not None:
+                                    log_f.write(json.dumps({
+                                        "type": "warmup_end",
+                                        "tau_0": float(tau_0),
+                                        "beta_0": float(beta)
+                                    }) + "\n")
+                                    log_f.flush()
+                                needs_ema_init = False
+                                tau = tau_0
+                            else:
+                                tau = ema.update_tau(gm)
+                            num_margin = int(gm.numel())
+                            p_hat = empirical_over_threshold_proportion(gm, tau)
+                            is_over_risk, eplison, delta_prime = risk_test(
+                                p_hat=p_hat,
+                                eplison_0=eplison_0,
+                                delta=delta,
+                                n=num_margin
+                            )
 
-                        beta, u_k, s_k, alpha_used = update_beta(
-                            beta, p_hat, delta_prime, eplison, alpha, gamma, beta_min, beta_max
+                            beta, u_k, s_k, alpha_used = update_beta(
+                                beta, p_hat, delta_prime, eplison, alpha, gamma, beta_min, beta_max
+                            )
+                            return {
+                                "tau": tau,
+                                "p_hat": p_hat,
+                                "risk_over": is_over_risk,
+                                "beta": beta,
+                                "u_k": u_k,
+                                "s_k": s_k,
+                                "alpha": alpha_used,
+                            }
+
+                        global_margins, tau, beta_used, stats = gather_global_margins_and_broadcast_scalars(
+                            accelerator, local_margins, compute_from_global
                         )
-                        beta_used = beta
+                        beta = beta_used
 
-                        risk_stat["total"] += 1
-                        if is_over_risk:
-                            risk_stat["fail"] += 1
+                        if accelerator.is_main_process and stats is not None:
+                            risk_stat["total"] += 1
+                            if stats["risk_over"]:
+                                risk_stat["fail"] += 1
 
-                        log_f.write(json.dumps({
-                            "step": int(global_steps),
-                            "tau": float(tau),
-                            "p_hat": float(p_hat),
-                            "risk_over": bool(is_over_risk),
-                            "beta": float(beta),
-                            "u_k": float(u_k),
-                            "s_k": float(s_k),
-                            "alpha": float(alpha_used),
-                        }) + "\n")
-                        log_f.flush()
+                            if log_f is not None:
+                                log_f.write(json.dumps({
+                                    "step": int(global_steps),
+                                    "tau": float(stats["tau"]),
+                                    "p_hat": float(stats["p_hat"]),
+                                    "risk_over": bool(stats["risk_over"]),
+                                    "beta": float(stats["beta"]),
+                                    "u_k": float(stats["u_k"]),
+                                    "s_k": float(stats["s_k"]),
+                                    "alpha": float(stats["alpha"]),
+                                }) + "\n")
+                                log_f.flush()
 
-                compute_and_log_model_margin(
-                    model_margin=model_margin, epoch_dir=epoch_dir, epoch=epoch, step=step, JSONL_PATH=JSONL_PATH
-                )
+                if accelerator.is_main_process:
+                    margins_for_logging = model_margin
+                    if is_dynamic and global_margins is not None:
+                        margins_for_logging = global_margins
+                    compute_and_log_model_margin(
+                        model_margin=margins_for_logging,
+                        epoch_dir=epoch_dir,
+                        epoch=epoch,
+                        step=step,
+                        JSONL_PATH=JSONL_PATH
+                    )
 
                 loss_raw, chosen_rewards, rejected_rewards = dpo_loss(
                     policy_chosen_log_prob, policy_rejected_log_prob, ref_chosen_log_prob, ref_rejected_log_prob, beta=beta_used
@@ -280,35 +381,17 @@ def train(config_path: str, mode: str = "dynamic"):
                 avg_model_margin = model_margin.mean()
 
             optimizer.zero_grad()
-            loss.backward()
+            accelerator.backward(loss)
             
             # Dynamic often clips grad only after warmup, but static usually always clips. 
-            # In original training.py (dynamic), clip is always on. 
-            # Wait, original training.py: lines 205-211 had `if global_steps >= warmup_steps:` wrapper, but that was probably for stepping optimizer?
-            # Re-reading original `training.py` code provided in view_file:
-            # Lines 297: `torch.nn.utils.clip_grad_norm_` is UNCONDITIONALLY called.
-            # Lines 298: `optimizer.step()` is UNCONDITIONALLY called.
-            # Ah, wait. In `dpo_training.py` (static), lines 206-210 had `if global_steps >= warmup_steps: clip; step;`.
-            # This logic seems divergent. I will unify to standard DPO practice: always step. "Warmup" usually refers to LR schedule or beta warmup.
-            # However, if the user intended to freeze updates during warmup, I should respect that.
-            # Let's check `training.py` (dynamic) loop again.
-            # lines 295-298: just zero_grad, backward, clip, step. No warmup check.
-            # So dynamic DPO *updates* weights during beta warmup.
-            # Now `dpo_training.py` (static):
-            # lines 205: `if global_steps >= warmup_steps:` then clip and step.
-            # This implies static DPO *skips* updates for the first N steps? That's odd. Usually warmup means LR warmup.
-            # Maybe `warmup_steps` here means "reference model warmup" or something? No, it's DPO.
-            # I will follow `training.py` behavior (always update) as it seems more standard, unless `dpo_training.py` has a specific reason.
-            # Given `dpo_training.py` was likely an earlier or alternative experiment, and `training.py` is the main dynamic one, I'll stick to `training.py`'s update logic (always update).
-            # If `dpo_training.py` really wanted to skip steps, that's a very specific behavior. I'll make it always update for now to be safe and consistent.
-            
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=max_grad_norm)
+           
+            accelerator.clip_grad_norm_(policy.parameters(), max_norm=max_grad_norm)
             optimizer.step()
             
             global_steps += 1 
             running_loss += loss.item()
             
-            if (step + 1) % log_steps == 0:
+            if accelerator.is_main_process and (step + 1) % log_steps == 0:
                 avg_loss = running_loss / log_steps
                 pbar.set_postfix(loss=f"{avg_loss:.3f}")
                 wandb.log({
@@ -320,18 +403,23 @@ def train(config_path: str, mode: str = "dynamic"):
                 })
                 running_loss = 0.0
 
-        eval_metrics = evaluate(policy, ref_model, val_loader, beta=beta_used, device=device)
-        logger.info(f"[eval] loss={eval_metrics['eval_loss']:.4f} acc={eval_metrics['eval_reward_accuracy']:.3f}")
-        wandb.log(eval_metrics)
+        eval_metrics = evaluate(policy, ref_model, val_loader, beta=beta_used, accelerator=accelerator)
+        if accelerator.is_main_process:
+            logger.info(f"[eval] loss={eval_metrics['eval_loss']:.4f} acc={eval_metrics['eval_reward_accuracy']:.3f}")
+            wandb.log(eval_metrics)
 
-        if is_dynamic:
-             logger.info(f"[RISK] fail {risk_stat['fail']} / {risk_stat['total']}")
+            if is_dynamic:
+                logger.info(f"[RISK] fail {risk_stat['fail']} / {risk_stat['total']}")
 
-    if is_dynamic:
+    if is_dynamic and log_f is not None:
         log_f.close()
 
     save_dir = config['dpo_training'].get('save_dir', 'dpo_model')
-    policy.save_pretrained(save_dir)
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        unwrapped_policy = accelerator.unwrap_model(policy)
+        state_dict = accelerator.get_state_dict(policy)
+        unwrapped_policy.save_pretrained(save_dir, state_dict=state_dict)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
