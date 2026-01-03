@@ -12,18 +12,39 @@ import json
 import logging
 from typing import Dict, Any
 
-from .data import build_train_val
-from .modeling import (
-    dpo_loss, 
-    margin_compute, 
-    compute_and_log_model_margin, 
-    compute_batch_log_prob,
-    empirical_over_threshold_proportion, 
-    risk_test, 
-    update_beta,
-    WarmupQuantileAccumulator,
-    EMAUpdate
-)
+try:
+    from .data import build_train_val
+    from .modeling import (
+        dpo_loss,
+        margin_compute,
+        compute_and_log_model_margin,
+        compute_batch_log_prob,
+        empirical_over_threshold_proportion,
+        risk_test,
+        update_beta,
+        WarmupQuantileAccumulator,
+        EMAUpdate,
+    )
+except ImportError:  # Allows running as a script: uv run src/dynamic_dpo/train.py
+    import os
+    import sys
+
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+    if module_dir not in sys.path:
+        sys.path.insert(0, module_dir)
+
+    from data import build_train_val
+    from modeling import (
+        dpo_loss,
+        margin_compute,
+        compute_and_log_model_margin,
+        compute_batch_log_prob,
+        empirical_over_threshold_proportion,
+        risk_test,
+        update_beta,
+        WarmupQuantileAccumulator,
+        EMAUpdate,
+    )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
