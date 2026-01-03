@@ -166,7 +166,7 @@ def build_accelerator(config: Dict[str, Any], policy, mixed_precision: str) -> A
         mixed_precision_policy=mp_policy,
         state_dict_type=StateDictType.FULL_STATE_DICT,
         state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-        limit_all_gathers=bool(fsdp_config.get("limit_all_gathers", False)),
+        limit_all_gathers=bool(fsdp_config.get("limit_all_gathers", True)),
     )
     plugin_sig = inspect.signature(FullyShardedDataParallelPlugin)
     actual_fsdp_version = fsdp_version if use_fsdp2 else 1
@@ -282,7 +282,11 @@ def train(config_path: str, mode: str = "dynamic"):
     # Load models
     policy_name = config['policy_name']
     ref_name = config['ref_name']
-    policy = AutoModelForCausalLM.from_pretrained(policy_name)
+    use_bf16 = config['precision'] == 'bf16' and torch.cuda.is_available()
+    policy_load_kwargs = {}
+    if use_bf16:
+        policy_load_kwargs["torch_dtype"] = torch.bfloat16
+    policy = AutoModelForCausalLM.from_pretrained(policy_name, **policy_load_kwargs)
     tok = AutoTokenizer.from_pretrained(policy_name)
     policy.config.pad_token_id = tok.pad_token_id
 
@@ -295,7 +299,6 @@ def train(config_path: str, mode: str = "dynamic"):
     ref_model.config.pad_token_id = tok.pad_token_id
     ref_model.requires_grad_(False)
 
-    use_bf16 = config['precision'] == 'bf16' and torch.cuda.is_available()
     mixed_precision = "bf16" if use_bf16 else "no"
     accelerator = build_accelerator(config, policy, mixed_precision=mixed_precision)
     device = accelerator.device

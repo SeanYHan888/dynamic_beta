@@ -62,6 +62,7 @@ fsdp:
   enabled: true
   version: 2
   reshard_after_forward: true
+  limit_all_gathers: true
 
 
 
