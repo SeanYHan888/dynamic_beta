@@ -1,13 +1,24 @@
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from datasets import load_dataset
-from dataset_process_hh import split_prompt_and_response
-import os
-import json
-import random
-import yaml
-from tqdm import tqdm
 import argparse
+import json
+import os
+import random
+import sys
+
+import torch
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from tqdm import tqdm
+import yaml
+
+try:
+    from dynamic_dpo.data import split_prompt_and_response
+except ModuleNotFoundError:
+    # Allow running from repo root without installing the package.
+    repo_root = os.path.dirname(os.path.dirname(__file__))
+    src_root = os.path.join(repo_root, "src")
+    if src_root not in sys.path:
+        sys.path.insert(0, src_root)
+    from dynamic_dpo.data import split_prompt_and_response
 
 # load yaml config
 def load_yaml_config(path):
