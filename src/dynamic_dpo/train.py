@@ -327,13 +327,12 @@ def train(config_path: str, mode: str = "dynamic"):
     train_loader, val_loader, train_sampler, val_sampler = build_train_val(config=config, tokenizer=tok)
 
     optimizer = AdamW(params=policy.parameters(), lr=float(config['dpo_training']['learning_rate']))
-    policy, optimizer, train_loader, val_loader = accelerator.prepare(
-        policy, optimizer, train_loader, val_loader
-    )
 
     if use_bf16:
         ref_model.to(dtype=torch.bfloat16)
-    ref_model.to(device)
+    policy, ref_model, optimizer, train_loader, val_loader = accelerator.prepare(
+        policy, ref_model, optimizer, train_loader, val_loader
+    )
     policy.train()
     ref_model.eval()
     if accelerator.is_main_process:
@@ -484,67 +483,78 @@ def train(config_path: str, mode: str = "dynamic"):
 
                 # Dynamic DPO Logic
                 beta_used = beta
+                margins_for_log = model_margin
                 if is_dynamic:
-                    # Sync margins for correct global statistics
-                    # We gather the margins from all GPUs so every rank calculates stats on the full global batch
+                    # Sync margins for correct global statistics; compute risk only on rank0.
                     all_margins = accelerator.gather(model_margin)
-                    
-                    if not warmup_done:
-                        threshold_accumulator.update(all_margins)
-                        warmup_count += 1
-                        if warmup_count >= warmup_steps:
-                            tau_0 = threshold_accumulator.finalize()
-                            # Since everyone has the same all_margins history, tau_0 is identical on all ranks.
-                            ema = EMAUpdate(tau_0=tau_0, q=q, momentum=momentum)
-                            warmup_done = True
+                    margins_for_log = all_margins
+
+                    if accelerator.is_main_process:
+                        if not warmup_done:
+                            threshold_accumulator.update(all_margins)
+                            warmup_count += 1
+                            if warmup_count >= warmup_steps:
+                                tau_0 = threshold_accumulator.finalize()
+                                ema = EMAUpdate(tau_0=tau_0, q=q, momentum=momentum)
+                                warmup_done = True
+                                if log_f is not None:
+                                    log_f.write(json.dumps({
+                                        "type": "warmup_end",
+                                        "tau_0": float(tau_0),
+                                        "beta_0": float(beta)
+                                    }) + "\n")
+                                    log_f.flush()
+                            beta_used = beta_0
+                        else:
+                            tau = ema.update_tau(all_margins)
+
+                            # Calculate p_hat exactly using the global batch
+                            num_margin = all_margins.numel()
+                            p_hat = empirical_over_threshold_proportion(all_margins, tau)
+
+                            is_over_risk, eplison, delta_prime = risk_test(
+                                p_hat=p_hat,
+                                eplison_0=eplison_0,
+                                delta=delta,
+                                n=num_margin,
+                            )
+
+                            beta, u_k, s_k, alpha_used = update_beta(
+                                beta, p_hat, delta_prime, eplison, alpha, gamma, beta_min, beta_max
+                            )
+                            beta_used = beta
+
+                            if risk_stat is not None:
+                                risk_stat["total"] += 1
+                                if is_over_risk:
+                                    risk_stat["fail"] += 1
+
                             if log_f is not None:
                                 log_f.write(json.dumps({
-                                    "type": "warmup_end",
-                                    "tau_0": float(tau_0),
-                                    "beta_0": float(beta)
+                                    "step": int(global_steps),
+                                    "tau": float(tau),
+                                    "p_hat": float(p_hat),
+                                    "risk_over": bool(is_over_risk),
+                                    "beta": float(beta),
+                                    "u_k": float(u_k),
+                                    "s_k": float(s_k),
+                                    "alpha": float(alpha_used),
                                 }) + "\n")
                                 log_f.flush()
-                        beta_used = beta_0
-                    else:
-                        tau = ema.update_tau(all_margins)
-                        
-                        # Calculate p_hat exactly using the global batch
-                        num_margin = all_margins.numel()
-                        p_hat = empirical_over_threshold_proportion(all_margins, tau)
-    
-                        is_over_risk, eplison, delta_prime = risk_test(
-                            p_hat=p_hat,
-                            eplison_0=eplison_0,
-                            delta=delta,
-                            n=num_margin,
+
+                    if accelerator.num_processes > 1 and torch.distributed.is_initialized():
+                        sync = torch.tensor(
+                            [beta, beta_used, float(warmup_done)],
+                            device=device,
                         )
-
-                        beta, u_k, s_k, alpha_used = update_beta(
-                            beta, p_hat, delta_prime, eplison, alpha, gamma, beta_min, beta_max
-                        )
-                        beta_used = beta
-
-                        if risk_stat is not None:
-                            risk_stat["total"] += 1
-                            if is_over_risk:
-                                risk_stat["fail"] += 1
-
-                        if log_f is not None:
-                            log_f.write(json.dumps({
-                                "step": int(global_steps),
-                                "tau": float(tau),
-                                "p_hat": float(p_hat),
-                                "risk_over": bool(is_over_risk),
-                                "beta": float(beta),
-                                "u_k": float(u_k),
-                                "s_k": float(s_k),
-                                "alpha": float(alpha_used),
-                            }) + "\n")
-                            log_f.flush()
+                        torch.distributed.broadcast(sync, src=0)
+                        beta = float(sync[0].item())
+                        beta_used = float(sync[1].item())
+                        warmup_done = bool(int(sync[2].item()))
 
                 if accelerator.is_main_process and margin_log_every > 0 and (global_steps % margin_log_every == 0):
                     compute_and_log_model_margin(
-                        model_margin=model_margin,
+                        model_margin=margins_for_log,
                         epoch_dir=epoch_dir,
                         epoch=epoch,
                         step=step,
@@ -606,8 +616,8 @@ def train(config_path: str, mode: str = "dynamic"):
 
     save_dir = config['dpo_training'].get('save_dir', 'dpo_model')
     accelerator.wait_for_everyone()
+    state_dict = accelerator.get_state_dict(policy)
     if accelerator.is_main_process:
-        state_dict = accelerator.get_state_dict(policy)
         unwrapped = accelerator.unwrap_model(policy)
         unwrapped.save_pretrained(save_dir, state_dict=state_dict)
 
