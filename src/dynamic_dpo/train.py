@@ -699,25 +699,26 @@ def train(config_path: str, mode: str = "dynamic"):
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             logger.info("[save] rank0 saved sharded checkpoint to %s", save_dir)
-            shard_dir = resolve_fsdp_shard_dir(shard_dir)
-            if shard_dir is None:
-                shard_dir = resolve_fsdp_shard_dir(save_dir)
-                if shard_dir:
-                    logger.info("[save] rank0 using existing FSDP shard dir %s", shard_dir)
-            if shard_dir:
-                hf_save_dir = config.get("dpo_training", {}).get("save_pretrained_dir")
-                if not hf_save_dir:
-                    hf_save_dir = os.path.join(save_dir, "hf_pretrained")
+        shard_dir = resolve_fsdp_shard_dir(shard_dir)
+        if shard_dir is None:
+            shard_dir = resolve_fsdp_shard_dir(save_dir)
+            if accelerator.is_main_process and shard_dir:
+                logger.info("[save] rank0 using existing FSDP shard dir %s", shard_dir)
+        if shard_dir:
+            hf_save_dir = config.get("dpo_training", {}).get("save_pretrained_dir")
+            if not hf_save_dir:
+                hf_save_dir = os.path.join(save_dir, "hf_pretrained")
+            if accelerator.is_main_process:
                 logger.info("[save] rank0 merging shards to HF format at %s", hf_save_dir)
-                merged_dir = save_hf_pretrained_from_fsdp_shards(
-                    shard_dir,
-                    hf_save_dir,
-                    logger=logger,
-                )
-                if merged_dir:
-                    logger.info("[save] rank0 saved HF model to %s", merged_dir)
-            else:
-                logger.warning("[save] rank0 no FSDP shards available; skipping HF merge")
+            merged_dir = save_hf_pretrained_from_fsdp_shards(
+                shard_dir,
+                hf_save_dir,
+                logger=logger if accelerator.is_main_process else None,
+            )
+            if accelerator.is_main_process and merged_dir:
+                logger.info("[save] rank0 saved HF model to %s", merged_dir)
+        elif accelerator.is_main_process:
+            logger.warning("[save] rank0 no FSDP shards available; skipping HF merge")
     else:
         logger.info("[save] rank=%s gathering state dict", accelerator.process_index)
         state_dict = accelerator.get_state_dict(policy)
