@@ -30,6 +30,8 @@ test:
   dpo_out_dir: eval_outputs/dpo_out.jsonl
   dynamic_dpo_out_dir: eval_outputs/dynamic_dpo_out.jsonl
   ref_out_dir: eval_outputs/ref_out.jsonl
+  judge_model: gpt-4.1
+  summary_output: eval_outputs/summary.json
 
 risk_test:
   delta: 0.1

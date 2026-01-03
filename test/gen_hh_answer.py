@@ -1,7 +1,7 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
-from dataset_process_hh import split_prompt_and_response
+from dynamic_dpo.old.dataset_process_hh import split_prompt_and_response
 import os
 import json
 import random

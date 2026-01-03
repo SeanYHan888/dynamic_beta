@@ -6,7 +6,7 @@ import yaml
 from tqdm import tqdm
 import random
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from dataset_process_hh import build_train_val
+from dynamic_dpo.old.dataset_process_hh import build_train_val
 from dpo_loss import dpo_loss, margin_compute, compute_and_log_model_margin, empirical_over_threshold_proportion, risk_test, update_beta
 from batch_log_prob import compute_batch_log_prob
 import wandb
