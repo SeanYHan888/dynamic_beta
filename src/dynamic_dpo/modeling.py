@@ -4,6 +4,7 @@ import numpy as np
 import math
 import os
 import json
+import inspect
 from typing import Tuple, Dict, Any, Optional
 
 # --- Log Probability Calculation ---
@@ -221,21 +222,52 @@ def save_hf_pretrained_from_fsdp_shards(
 
     os.makedirs(output_dir, exist_ok=True)
     try:
-        merge_fsdp_weights(
-            checkpoint_dir,
-            output_dir,
-            safe_serialization=safe_serialization,
-            max_shard_size=max_shard_size,
-        )
-    except TypeError:
-        try:
-            merge_fsdp_weights(
-                checkpoint_dir,
-                output_dir,
-                safe_serialization=safe_serialization,
-            )
-        except TypeError:
-            merge_fsdp_weights(checkpoint_dir, output_dir)
+        sig = inspect.signature(merge_fsdp_weights)
+        kwargs = {}
+        if "safe_serialization" in sig.parameters:
+            kwargs["safe_serialization"] = safe_serialization
+        if "max_shard_size" in sig.parameters:
+            kwargs["max_shard_size"] = max_shard_size
+        merge_fsdp_weights(checkpoint_dir, output_dir, **kwargs)
+    except Exception as exc:
+        msg = f"merge_fsdp_weights failed; skipping HF save. error={exc}"
+        if logger is not None:
+            logger.warning(msg)
+        else:
+            print(msg)
+        return None
+    return output_dir
+
+
+def save_fsdp_sharded_checkpoint(
+    accelerator,
+    model,
+    output_dir: str,
+    logger: Optional[Any] = None,
+) -> Optional[str]:
+    """
+    Save FSDP model shards via accelerate if available.
+    """
+    try:
+        from accelerate.utils import save_fsdp_model
+    except Exception as exc:
+        msg = f"save_fsdp_model unavailable; skipping FSDP shard save. error={exc}"
+        if logger is not None:
+            logger.warning(msg)
+        else:
+            print(msg)
+        return None
+
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        save_fsdp_model(accelerator, model, output_dir)
+    except Exception as exc:
+        msg = f"save_fsdp_model failed; skipping FSDP shard save. error={exc}"
+        if logger is not None:
+            logger.warning(msg)
+        else:
+            print(msg)
+        return None
     return output_dir
 
 
