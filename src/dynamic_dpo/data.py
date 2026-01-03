@@ -101,6 +101,7 @@ def collate_fn(batch, tokenizer, max_len, truncate_prompt=False):
 
     def ensure_eos_token(input_ids: torch.Tensor, attention_mask: torch.Tensor) -> None:
         eos_id = tokenizer.eos_token_id
+        bos_id = tokenizer.bos_token_id
         if eos_id is None:
             return
         seq_len = input_ids.size(1)
@@ -110,6 +111,9 @@ def collate_fn(batch, tokenizer, max_len, truncate_prompt=False):
                 continue
             last_idx = min(length - 1, seq_len - 1)
             if input_ids[i, last_idx].item() == eos_id:
+                continue
+            if length == 1 and bos_id is not None and input_ids[i, 0].item() == bos_id and bos_id != eos_id:
+                # Preserve BOS if it's the only token and no space for EOS.
                 continue
             if length < seq_len:
                 input_ids[i, length] = eos_id
@@ -147,6 +151,8 @@ def collate_fn(batch, tokenizer, max_len, truncate_prompt=False):
                 prompt_ids = []
 
             max_response_len = max_len - len(bos) - len(prompt_ids) - len(eos)
+            if max_response_len < 0:
+                max_response_len = 0
             chosen_ids = chosen_ids[:max_response_len]
             rejected_ids = rejected_ids[:max_response_len]
 
@@ -312,6 +318,5 @@ def build_train_val(config, tokenizer):
 
     # Return None for samplers as they are now handled implicitly or internally
     return train_loader, val_loader, None, None
-
 
 
