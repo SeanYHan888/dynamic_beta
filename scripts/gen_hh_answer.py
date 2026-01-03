@@ -5,7 +5,7 @@ import random
 import argparse
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 import yaml
 from tqdm import tqdm
@@ -16,11 +16,33 @@ if SRC_DIR not in sys.path:
     sys.path.append(SRC_DIR)
 
 from dynamic_dpo.data import split_prompt_and_response
+from dynamic_dpo.modeling import resolve_fsdp_shard_dir, save_hf_pretrained_from_fsdp_shards
 
 # load yaml config
 def load_yaml_config(path):
     with open(path, 'r') as f:
         return yaml.safe_load(f)
+
+def is_non_empty_dir(path):
+    try:
+        return os.path.isdir(path) and any(os.scandir(path))
+    except OSError:
+        return False
+
+def resolve_fsdp_checkpoint_dir(path):
+    shard_dir = resolve_fsdp_shard_dir(path)
+    if shard_dir is None:
+        parent = os.path.dirname(path)
+        if parent and parent != path:
+            shard_dir = resolve_fsdp_shard_dir(parent)
+    if shard_dir is None:
+        raise FileNotFoundError(f"No FSDP shard directory found under: {path}")
+    merged_dir = os.path.join(os.path.dirname(shard_dir), "hf_pretrained_from_shards")
+    if not is_non_empty_dir(merged_dir):
+        merged_dir = save_hf_pretrained_from_fsdp_shards(shard_dir, merged_dir)
+    if merged_dir is None:
+        raise RuntimeError(f"Failed to merge FSDP shards from: {shard_dir}")
+    return merged_dir
 
 # sample N data for test
 def sample(dataset, N, seed):
@@ -74,6 +96,11 @@ def generate(model, tokenizer, prompts, device, max_new_tokens, temperature, top
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
+    parser.add_argument(
+        "--shard",
+        action="store_true",
+        help="Load policy model from an FSDP sharded checkpoint (merge on the fly).",
+    )
     args=parser.parse_args()
 
     config = load_yaml_config(args.config)
@@ -97,7 +124,13 @@ def main():
     # policy1.eval()
 
     # our method
-    policy2 = AutoModelForCausalLM.from_pretrained(policy2_path).to(device)
+    if args.shard:
+        merged_dir = resolve_fsdp_checkpoint_dir(policy2_path)
+        base_model_name = config.get("policy_name", ref_name)
+        base_config = AutoConfig.from_pretrained(base_model_name)
+        policy2 = AutoModelForCausalLM.from_pretrained(merged_dir, config=base_config).to(device)
+    else:
+        policy2 = AutoModelForCausalLM.from_pretrained(policy2_path).to(device)
     policy2.config.pad_token_id = tok.pad_token_id
     policy2.eval()
 
