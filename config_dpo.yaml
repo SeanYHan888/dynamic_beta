@@ -14,6 +14,7 @@ dataset:
   
 dpo_training:
   epochs: 1
+  beta: 0.1
   batch_size: 16
   learning_rate: 5e-7
   log_steps: 10
@@ -55,7 +56,7 @@ margin_log:
   save_npy: true
 
 debug:
-  max_batches: 1
+  max_batches: 100
   max_preview_tokens: 512
   print_batches: 0
   log_path: logs/debug_batches.jsonl
