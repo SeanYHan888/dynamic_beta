@@ -6,6 +6,7 @@ import numpy as np
 import yaml
 from tqdm import tqdm
 import random
+from functools import partial
 from accelerate import Accelerator, FullyShardedDataParallelPlugin
 from torch.distributed.fsdp import FullStateDictConfig, FullOptimStateDictConfig
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -22,11 +23,9 @@ try:
         margin_compute,
         compute_and_log_model_margin,
         compute_batch_log_prob,
-        empirical_over_threshold_proportion,
-        risk_test,
-        update_beta,
         WarmupQuantileAccumulator,
         EMAUpdate,
+        compute_dynamic_beta_update,
         gather_global_margins_and_broadcast_scalars,
     )
 except ImportError:  # Allows running as a script: uv run src/dynamic_dpo/train.py
@@ -43,11 +42,9 @@ except ImportError:  # Allows running as a script: uv run src/dynamic_dpo/train.
         margin_compute,
         compute_and_log_model_margin,
         compute_batch_log_prob,
-        empirical_over_threshold_proportion,
-        risk_test,
-        update_beta,
         WarmupQuantileAccumulator,
         EMAUpdate,
+        compute_dynamic_beta_update,
         gather_global_margins_and_broadcast_scalars,
     )
 
@@ -230,6 +227,7 @@ def train(config_path: str, mode: str = "dynamic"):
         if accelerator.is_main_process:
             log_f = open("risk_test_and_beta_log.jsonl", "w", encoding="utf-8")
         warmup_steps = max(0, int(config['dpo_training']['warmup_steps']))
+        # warmup_steps==0 means we skip buffering and initialize EMA tau from the first batch.
         warmup_done = warmup_steps == 0
         needs_ema_init = warmup_steps == 0
         warmup_count = 0
@@ -275,14 +273,17 @@ def train(config_path: str, mode: str = "dynamic"):
                 # Dynamic DPO Logic
                 beta_used = beta
                 global_margins = None
+                tau_for_log = None
                 if is_dynamic:
                     local_margins = model_margin.detach().float().view(-1)
                     if not warmup_done:
+                        # Warmup: gather global margins and buffer them for tau_0.
                         global_margins = accelerator.gather_for_metrics(local_margins)
                         if accelerator.is_main_process:
                             threshold_accumulator.update(global_margins)
                         warmup_count += 1
                         if warmup_count == warmup_steps:
+                            # Warmup end: tau_0 from global margins, then initialize EMA.
                             if accelerator.is_main_process:
                                 tau_0 = threshold_accumulator.finalize()
                                 ema = EMAUpdate(tau_0=tau_0, q=q, momentum=momentum)
@@ -297,51 +298,41 @@ def train(config_path: str, mode: str = "dynamic"):
                             needs_ema_init = False
                         beta_used = beta_0
                     else:
-                        def compute_from_global(global_margins):
-                            nonlocal beta, ema, needs_ema_init
-                            gm = global_margins.detach().float().view(-1)
-                            if needs_ema_init:
-                                tau_0 = torch.quantile(gm, q).item()
-                                ema = EMAUpdate(tau_0=tau_0, q=q, momentum=momentum)
-                                if log_f is not None:
-                                    log_f.write(json.dumps({
-                                        "type": "warmup_end",
-                                        "tau_0": float(tau_0),
-                                        "beta_0": float(beta)
-                                    }) + "\n")
-                                    log_f.flush()
-                                needs_ema_init = False
-                                tau = tau_0
-                            else:
-                                tau = ema.update_tau(gm)
-                            num_margin = int(gm.numel())
-                            p_hat = empirical_over_threshold_proportion(gm, tau)
-                            is_over_risk, eplison, delta_prime = risk_test(
-                                p_hat=p_hat,
-                                eplison_0=eplison_0,
-                                delta=delta,
-                                n=num_margin
-                            )
+                        # Post-warmup: compute tau/p_hat/risk/beta on rank0 using global margins.
+                        compute_fn = partial(
+                            compute_dynamic_beta_update,
+                            beta=beta,
+                            ema=ema,
+                            needs_ema_init=needs_ema_init,
+                            q=q,
+                            momentum=momentum,
+                            eplison_0=eplison_0,
+                            delta=delta,
+                            alpha=alpha,
+                            gamma=gamma,
+                            beta_min=beta_min,
+                            beta_max=beta_max,
+                        )
 
-                            beta, u_k, s_k, alpha_used = update_beta(
-                                beta, p_hat, delta_prime, eplison, alpha, gamma, beta_min, beta_max
-                            )
-                            return {
-                                "tau": tau,
-                                "p_hat": p_hat,
-                                "risk_over": is_over_risk,
-                                "beta": beta,
-                                "u_k": u_k,
-                                "s_k": s_k,
-                                "alpha": alpha_used,
-                            }
-
+                        # Collect global margins on all ranks, compute tau/beta on rank0, then broadcast scalars.
                         global_margins, tau, beta_used, stats = gather_global_margins_and_broadcast_scalars(
-                            accelerator, local_margins, compute_from_global
+                            accelerator, local_margins, compute_fn
                         )
                         beta = beta_used
+                        tau_for_log = tau
 
                         if accelerator.is_main_process and stats is not None:
+                            # Update EMA state and log risk stats on rank0 only.
+                            if stats["warmup_end"] and log_f is not None:
+                                log_f.write(json.dumps({
+                                    "type": "warmup_end",
+                                    "tau_0": float(stats["tau_0"]),
+                                    "beta_0": float(stats["beta_before_update"]),
+                                }) + "\n")
+                                log_f.flush()
+
+                            ema = stats["ema"]
+                            needs_ema_init = stats["needs_ema_init"]
                             risk_stat["total"] += 1
                             if stats["risk_over"]:
                                 risk_stat["fail"] += 1
@@ -362,6 +353,7 @@ def train(config_path: str, mode: str = "dynamic"):
                 if accelerator.is_main_process:
                     margins_for_logging = model_margin
                     if is_dynamic and global_margins is not None:
+                        # Log global margins to reflect true distributed batch stats.
                         margins_for_logging = global_margins
                     compute_and_log_model_margin(
                         model_margin=margins_for_logging,
@@ -394,13 +386,16 @@ def train(config_path: str, mode: str = "dynamic"):
             if accelerator.is_main_process and (step + 1) % log_steps == 0:
                 avg_loss = running_loss / log_steps
                 pbar.set_postfix(loss=f"{avg_loss:.3f}")
-                wandb.log({
+                log_payload = {
                     'loss': avg_loss,
                     'chosen_rewards': avg_chosen_rewards.item(),
                     'rejected_rewards': avg_rejected_rewards.item(),
                     'model_margin': avg_model_margin.item(),
                     'beta': beta_used
-                })
+                }
+                if is_dynamic and tau_for_log is not None:
+                    log_payload['tau'] = tau_for_log
+                wandb.log(log_payload)
                 running_loss = 0.0
 
         eval_metrics = evaluate(policy, ref_model, val_loader, beta=beta_used, accelerator=accelerator)
@@ -414,6 +409,7 @@ def train(config_path: str, mode: str = "dynamic"):
     if is_dynamic and log_f is not None:
         log_f.close()
 
+# Save final model, rank 0 only, gather full state dict
     save_dir = config['dpo_training'].get('save_dir', 'dpo_model')
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:

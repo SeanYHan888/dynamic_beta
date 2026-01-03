@@ -172,10 +172,14 @@ class EMAUpdate:
 
     # threshold tau equations    
     def update_tau(self, batch_margins: torch.Tensor):
+        # Flatten and detach margins so quantile is computed on raw values without gradients.
         t = batch_margins.detach().float().view(-1)
+        # If the batch is empty, keep the previous EMA tau unchanged.
         if t.numel() == 0:
             return self.tau
+        # Per-batch tau from the desired quantile (q = 1 - delta).
         batch_tau = torch.quantile(t, self.q).item()
+        # Exponential moving average update to smooth tau across steps.
         self.tau = (1.0 - self.lam) * self.tau + self.lam * batch_tau
         return self.tau
 
@@ -193,6 +197,68 @@ def update_beta(beta, p_hat, delta_prime, eplison, alpha, gamma, beta_min, beta_
     beta_new = beta * math.exp(alpha * s_k)
     beta_new = max(beta_min, min(beta_new, beta_max))
     return beta_new, u_k, s_k, alpha
+
+def compute_dynamic_beta_update(
+    global_margins: torch.Tensor,
+    beta: float,
+    ema: Optional["EMAUpdate"],
+    needs_ema_init: bool,
+    q: float,
+    momentum: float,
+    eplison_0: float,
+    delta: float,
+    alpha: float,
+    gamma: float,
+    beta_min: float,
+    beta_max: float,
+) -> Dict[str, Any]:
+    # Use global (all-rank) margins to keep quantiles/risk estimates consistent.
+    gm = global_margins.detach().float().view(-1)
+    warmup_end = False
+    tau_0 = None
+    beta_before_update = None
+
+    if needs_ema_init or ema is None:
+        # Initialize EMA tau once (warmup_steps==0 or missing EMA).
+        tau_0 = torch.quantile(gm, q).item() if gm.numel() > 0 else 0.0
+        ema = EMAUpdate(tau_0=tau_0, q=q, momentum=momentum)
+        needs_ema_init = False
+        warmup_end = True
+        beta_before_update = beta
+        tau = tau_0
+    else:
+        # Post-warmup: update EMA tau using the current global batch.
+        tau = ema.update_tau(gm)
+
+    # Estimate tail risk from the global margins.
+    num_margin = int(gm.numel())
+    p_hat = empirical_over_threshold_proportion(gm, tau)
+    is_over_risk, eplison, delta_prime = risk_test(
+        p_hat=p_hat,
+        eplison_0=eplison_0,
+        delta=delta,
+        n=num_margin
+    )
+
+    # Apply multiplicative beta update (tanh + exp + clamp).
+    beta, u_k, s_k, alpha_used = update_beta(
+        beta, p_hat, delta_prime, eplison, alpha, gamma, beta_min, beta_max
+    )
+
+    return {
+        "tau": tau,
+        "p_hat": p_hat,
+        "risk_over": is_over_risk,
+        "beta": beta,
+        "u_k": u_k,
+        "s_k": s_k,
+        "alpha": alpha_used,
+        "ema": ema,
+        "needs_ema_init": needs_ema_init,
+        "warmup_end": warmup_end,
+        "tau_0": tau_0,
+        "beta_before_update": beta_before_update,
+    }
 
 def gather_global_margins_and_broadcast_scalars(
     accelerator,
