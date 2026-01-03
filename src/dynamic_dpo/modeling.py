@@ -259,6 +259,12 @@ def save_fsdp_sharded_checkpoint(
         return None
 
     os.makedirs(output_dir, exist_ok=True)
+    fsdp_plugin = None
+    if accelerator is not None:
+        fsdp_plugin = getattr(accelerator, "fsdp_plugin", None)
+        if fsdp_plugin is None:
+            state = getattr(accelerator, "state", None)
+            fsdp_plugin = getattr(state, "fsdp_plugin", None)
     try:
         sig = inspect.signature(save_fsdp_model)
     except (TypeError, ValueError):
@@ -268,6 +274,10 @@ def save_fsdp_sharded_checkpoint(
         if sig is not None:
             params = list(sig.parameters.keys())
             kwargs: Dict[str, Any] = {}
+            if "fsdp_plugin" in params:
+                kwargs["fsdp_plugin"] = fsdp_plugin
+            elif "plugin" in params:
+                kwargs["plugin"] = fsdp_plugin
             if "accelerator" in params:
                 kwargs["accelerator"] = accelerator
             if "model" in params:
@@ -281,7 +291,7 @@ def save_fsdp_sharded_checkpoint(
             elif "output_folder" in params:
                 kwargs["output_folder"] = output_dir
 
-            if kwargs:
+            if kwargs and ("fsdp_plugin" not in params or fsdp_plugin is not None):
                 save_fsdp_model(**kwargs)
             else:
                 raise TypeError("save_fsdp_model signature not recognized.")
@@ -289,7 +299,10 @@ def save_fsdp_sharded_checkpoint(
             raise TypeError("save_fsdp_model signature unavailable.")
     except Exception:
         try:
-            save_fsdp_model(accelerator, model, output_dir)
+            if fsdp_plugin is not None:
+                save_fsdp_model(fsdp_plugin, accelerator, model, output_dir)
+            else:
+                save_fsdp_model(accelerator, model, output_dir)
         except Exception:
             try:
                 save_fsdp_model(model, output_dir)
@@ -301,6 +314,35 @@ def save_fsdp_sharded_checkpoint(
                     print(msg)
                 return None
     return output_dir
+
+
+def resolve_fsdp_shard_dir(path: Optional[str]) -> Optional[str]:
+    def is_non_empty_dir(dir_path: str) -> bool:
+        try:
+            return os.path.isdir(dir_path) and any(os.scandir(dir_path))
+        except OSError:
+            return False
+
+    def find_fsdp_shard_dir(root_dir: str) -> Optional[str]:
+        try:
+            entries = os.listdir(root_dir)
+        except OSError:
+            return None
+        candidates = []
+        for name in entries:
+            if not name.startswith("pytorch_model_fsdp_"):
+                continue
+            candidate = os.path.join(root_dir, name)
+            if is_non_empty_dir(candidate):
+                candidates.append(candidate)
+        return sorted(candidates)[0] if candidates else None
+
+    if not path:
+        return None
+    base = os.path.basename(path)
+    if base.startswith("pytorch_model_fsdp_") and is_non_empty_dir(path):
+        return path
+    return find_fsdp_shard_dir(path)
 
 
 # --- Debug Utilities ---

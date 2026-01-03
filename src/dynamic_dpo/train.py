@@ -46,6 +46,7 @@ from .modeling import (
     build_debug_payload,
     save_hf_pretrained_from_fsdp_shards,
     save_fsdp_sharded_checkpoint,
+    resolve_fsdp_shard_dir,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -698,6 +699,11 @@ def train(config_path: str, mode: str = "dynamic"):
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             logger.info("[save] rank0 saved sharded checkpoint to %s", save_dir)
+            shard_dir = resolve_fsdp_shard_dir(shard_dir)
+            if shard_dir is None:
+                shard_dir = resolve_fsdp_shard_dir(save_dir)
+                if shard_dir:
+                    logger.info("[save] rank0 using existing FSDP shard dir %s", shard_dir)
             if shard_dir:
                 hf_save_dir = config.get("dpo_training", {}).get("save_pretrained_dir")
                 if not hf_save_dir:
@@ -720,6 +726,8 @@ def train(config_path: str, mode: str = "dynamic"):
             unwrapped = accelerator.unwrap_model(policy)
             unwrapped.save_pretrained(save_dir, state_dict=state_dict)
             logger.info("[save] rank0 saved model to %s", save_dir)
+
+    accelerator.end_training()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
