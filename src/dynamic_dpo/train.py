@@ -633,11 +633,22 @@ def train(config_path: str, mode: str = "dynamic"):
         debug_log_f.close()
 
     save_dir = config['dpo_training'].get('save_dir', 'dpo_model')
+    if accelerator.is_main_process:
+        logger.info("[save] starting save to %s", save_dir)
     accelerator.wait_for_everyone()
+    if torch.cuda.is_available():
+        logger.info(
+            "[save] cuda_mem_allocated=%s cuda_mem_reserved=%s",
+            torch.cuda.memory_allocated(),
+            torch.cuda.memory_reserved(),
+        )
+    logger.info("[save] rank=%s gathering state dict", accelerator.process_index)
     state_dict = accelerator.get_state_dict(policy)
+    logger.info("[save] rank=%s state dict gathered", accelerator.process_index)
     if accelerator.is_main_process:
         unwrapped = accelerator.unwrap_model(policy)
         unwrapped.save_pretrained(save_dir, state_dict=state_dict)
+        logger.info("[save] rank0 saved model to %s", save_dir)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
