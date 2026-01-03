@@ -16,7 +16,17 @@ try:
     from accelerate.utils import FullyShardedDataParallelPlugin
 except ImportError:
     from accelerate import FullyShardedDataParallelPlugin
-from torch.distributed.fsdp import FullStateDictConfig, MixedPrecision, ShardingStrategy, StateDictType
+try:
+    from torch.distributed.fsdp import (
+        FullStateDictConfig,
+        MixedPrecision,
+        ShardingStrategy,
+        StateDictType,
+        ShardedStateDictConfig,
+    )
+except ImportError:
+    from torch.distributed.fsdp import FullStateDictConfig, MixedPrecision, ShardingStrategy, StateDictType
+    ShardedStateDictConfig = None
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.optim import AdamW
 from tqdm import tqdm
@@ -160,12 +170,31 @@ def build_accelerator(config: Dict[str, Any], policy, mixed_precision: str) -> A
         else:
             raise ValueError(f"Unsupported fsdp.reshard_after_forward type: {type(reshard_cfg).__name__}")
 
+    save_sharded = bool(fsdp_config.get("save_sharded", False))
+    state_dict_type_cfg = str(fsdp_config.get("state_dict_type", "")).strip().lower()
+    use_sharded_state = save_sharded or state_dict_type_cfg in (
+        "sharded",
+        "sharded_state_dict",
+        "sharded_state",
+    )
+    state_dict_type = StateDictType.SHARDED_STATE_DICT if use_sharded_state else StateDictType.FULL_STATE_DICT
+    if use_sharded_state:
+        if ShardedStateDictConfig is not None:
+            state_dict_config = ShardedStateDictConfig(offload_to_cpu=True)
+        else:
+            logger.warning(
+                "ShardedStateDictConfig not available; using default sharded state dict config."
+            )
+            state_dict_config = None
+    else:
+        state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+
     fsdp_plugin_kwargs = dict(
         reshard_after_forward=reshard_after_forward,
         auto_wrap_policy=auto_wrap_policy,
         mixed_precision_policy=mp_policy,
-        state_dict_type=StateDictType.FULL_STATE_DICT,
-        state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+        state_dict_type=state_dict_type,
+        state_dict_config=state_dict_config,
         limit_all_gathers=bool(fsdp_config.get("limit_all_gathers", True)),
     )
     plugin_sig = inspect.signature(FullyShardedDataParallelPlugin)
@@ -282,10 +311,15 @@ def train(config_path: str, mode: str = "dynamic"):
     # Load models
     policy_name = config['policy_name']
     ref_name = config['ref_name']
-    use_bf16 = config['precision'] == 'bf16' and torch.cuda.is_available()
+    mp_config_raw = config.get("mixed_precision", config.get("precision", "no"))
+    mp_config = str(mp_config_raw).strip().lower()
+    use_bf16 = mp_config == "bf16" and torch.cuda.is_available()
+    use_fp16 = mp_config == "fp16" and torch.cuda.is_available()
     policy_load_kwargs = {}
     if use_bf16:
         policy_load_kwargs["torch_dtype"] = torch.bfloat16
+    elif use_fp16:
+        policy_load_kwargs["torch_dtype"] = torch.float16
     policy = AutoModelForCausalLM.from_pretrained(policy_name, **policy_load_kwargs)
     tok = AutoTokenizer.from_pretrained(policy_name)
     policy.config.pad_token_id = tok.pad_token_id
@@ -299,13 +333,14 @@ def train(config_path: str, mode: str = "dynamic"):
     ref_model.config.pad_token_id = tok.pad_token_id
     ref_model.requires_grad_(False)
 
-    mixed_precision = "bf16" if use_bf16 else "no"
+    mixed_precision = mp_config if mp_config in ("bf16", "fp16") and torch.cuda.is_available() else "no"
     accelerator = build_accelerator(config, policy, mixed_precision=mixed_precision)
     device = accelerator.device
     if accelerator.is_main_process:
         logger.info(
-            "precision config=%s cuda_available=%s mixed_precision=%s accelerator_mixed_precision=%s device=%s num_processes=%s",
+            "precision config=%s mixed_precision_config=%s cuda_available=%s mixed_precision=%s accelerator_mixed_precision=%s device=%s num_processes=%s",
             config.get("precision"),
+            mp_config_raw,
             torch.cuda.is_available(),
             mixed_precision,
             accelerator.mixed_precision,
@@ -345,6 +380,8 @@ def train(config_path: str, mode: str = "dynamic"):
 
     if use_bf16:
         ref_model.to(dtype=torch.bfloat16)
+    elif use_fp16:
+        ref_model.to(dtype=torch.float16)
     if getattr(accelerator, "_fsdp_version_used", None) == 2:
         policy, optimizer, train_loader, val_loader = accelerator.prepare(
             policy, optimizer, train_loader, val_loader
@@ -636,6 +673,7 @@ def train(config_path: str, mode: str = "dynamic"):
         debug_log_f.close()
 
     save_dir = config['dpo_training'].get('save_dir', 'dpo_model')
+    save_sharded = bool(config.get("fsdp", {}).get("save_sharded", False))
     if accelerator.is_main_process:
         logger.info("[save] starting save to %s", save_dir)
     accelerator.wait_for_everyone()
@@ -645,13 +683,19 @@ def train(config_path: str, mode: str = "dynamic"):
             torch.cuda.memory_allocated(),
             torch.cuda.memory_reserved(),
         )
-    logger.info("[save] rank=%s gathering state dict", accelerator.process_index)
-    state_dict = accelerator.get_state_dict(policy)
-    logger.info("[save] rank=%s state dict gathered", accelerator.process_index)
-    if accelerator.is_main_process:
-        unwrapped = accelerator.unwrap_model(policy)
-        unwrapped.save_pretrained(save_dir, state_dict=state_dict)
-        logger.info("[save] rank0 saved model to %s", save_dir)
+    if save_sharded:
+        logger.info("[save] rank=%s saving sharded checkpoint", accelerator.process_index)
+        accelerator.save_state(save_dir)
+        if accelerator.is_main_process:
+            logger.info("[save] rank0 saved sharded checkpoint to %s", save_dir)
+    else:
+        logger.info("[save] rank=%s gathering state dict", accelerator.process_index)
+        state_dict = accelerator.get_state_dict(policy)
+        logger.info("[save] rank=%s state dict gathered", accelerator.process_index)
+        if accelerator.is_main_process:
+            unwrapped = accelerator.unwrap_model(policy)
+            unwrapped.save_pretrained(save_dir, state_dict=state_dict)
+            logger.info("[save] rank0 saved model to %s", save_dir)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
