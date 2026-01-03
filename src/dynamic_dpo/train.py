@@ -46,6 +46,7 @@ from .modeling import (
     build_debug_payload,
     save_hf_pretrained_from_fsdp_shards,
     save_fsdp_sharded_checkpoint,
+    save_hf_artifacts,
     resolve_fsdp_shard_dir,
 )
 
@@ -699,6 +700,7 @@ def train(config_path: str, mode: str = "dynamic"):
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             logger.info("[save] rank0 saved sharded checkpoint to %s", save_dir)
+            save_hf_artifacts(accelerator.unwrap_model(policy), tok, save_dir, logger=logger)
         shard_dir = resolve_fsdp_shard_dir(shard_dir)
         if shard_dir is None:
             shard_dir = resolve_fsdp_shard_dir(save_dir)
@@ -716,6 +718,7 @@ def train(config_path: str, mode: str = "dynamic"):
                 logger=logger if accelerator.is_main_process else None,
             )
             if accelerator.is_main_process and merged_dir:
+                save_hf_artifacts(accelerator.unwrap_model(policy), tok, merged_dir, logger=logger)
                 logger.info("[save] rank0 saved HF model to %s", merged_dir)
         elif accelerator.is_main_process:
             logger.warning("[save] rank0 no FSDP shards available; skipping HF merge")
@@ -726,6 +729,7 @@ def train(config_path: str, mode: str = "dynamic"):
         if accelerator.is_main_process:
             unwrapped = accelerator.unwrap_model(policy)
             unwrapped.save_pretrained(save_dir, state_dict=state_dict)
+            save_hf_artifacts(unwrapped, tok, save_dir, logger=logger)
             logger.info("[save] rank0 saved model to %s", save_dir)
 
     accelerator.end_training()

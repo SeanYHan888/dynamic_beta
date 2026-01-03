@@ -316,6 +316,41 @@ def save_fsdp_sharded_checkpoint(
     return output_dir
 
 
+def save_hf_artifacts(model, tokenizer, output_dir: str, logger: Optional[Any] = None) -> Optional[str]:
+    os.makedirs(output_dir, exist_ok=True)
+    if model is not None:
+        try:
+            config = getattr(model, "config", None)
+            if config is not None:
+                config.save_pretrained(output_dir)
+        except Exception as exc:
+            msg = f"save_pretrained config failed; skipping. error={exc}"
+            if logger is not None:
+                logger.warning(msg)
+            else:
+                print(msg)
+        try:
+            gen_config = getattr(model, "generation_config", None)
+            if gen_config is not None:
+                gen_config.save_pretrained(output_dir)
+        except Exception as exc:
+            msg = f"save_pretrained generation config failed; skipping. error={exc}"
+            if logger is not None:
+                logger.warning(msg)
+            else:
+                print(msg)
+    if tokenizer is not None:
+        try:
+            tokenizer.save_pretrained(output_dir)
+        except Exception as exc:
+            msg = f"save_pretrained tokenizer failed; skipping. error={exc}"
+            if logger is not None:
+                logger.warning(msg)
+            else:
+                print(msg)
+    return output_dir
+
+
 def resolve_fsdp_shard_dir(path: Optional[str]) -> Optional[str]:
     def is_non_empty_dir(dir_path: str) -> bool:
         try:
