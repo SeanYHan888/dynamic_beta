@@ -438,8 +438,7 @@ def build_debug_payload(batch: Dict[str, torch.Tensor], tokenizer, max_preview_t
     rejected_text = tokenizer.decode(rejected_resp_ids, skip_special_tokens=True)
 
     def preview(tensor: torch.Tensor) -> list:
-        # Preserve the batch dimension so debug logs show matrices, not flat lists.
-        return tensor[:, :max_preview_tokens].tolist()
+        return tensor[0].tolist()[:max_preview_tokens]
 
     chosen_supervised = (chosen_labels != -100).sum(dim=1)
     rejected_supervised = (rejected_labels != -100).sum(dim=1)
