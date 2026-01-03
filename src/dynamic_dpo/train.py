@@ -47,6 +47,7 @@ from .modeling import (
     save_hf_pretrained_from_fsdp_shards,
     save_fsdp_sharded_checkpoint,
     save_hf_artifacts,
+    get_fsdp2_full_state_dict,
     resolve_fsdp_shard_dir,
 )
 
@@ -676,6 +677,8 @@ def train(config_path: str, mode: str = "dynamic"):
     if debug_log_f is not None:
         debug_log_f.close()
 
+# Save final model， save sharded if configured, else save as all-gathered. 
+# If sharded save, also merge to HF format.
     save_dir = config['dpo_training'].get('save_dir', 'dpo_model')
     save_sharded = bool(config.get("fsdp", {}).get("save_sharded", False))
     if accelerator.is_main_process:
@@ -707,6 +710,7 @@ def train(config_path: str, mode: str = "dynamic"):
             if accelerator.is_main_process and shard_dir:
                 logger.info("[save] rank0 using existing FSDP shard dir %s", shard_dir)
         if shard_dir:
+            # Merge shards to HF format
             hf_save_dir = config.get("dpo_training", {}).get("save_pretrained_dir")
             if not hf_save_dir:
                 hf_save_dir = os.path.join(save_dir, "hf_pretrained")
@@ -723,8 +727,17 @@ def train(config_path: str, mode: str = "dynamic"):
         elif accelerator.is_main_process:
             logger.warning("[save] rank0 no FSDP shards available; skipping HF merge")
     else:
-        logger.info("[save] rank=%s gathering state dict", accelerator.process_index)
-        state_dict = accelerator.get_state_dict(policy)
+        # Non-sharded save, might use large memory
+        use_fsdp2 = getattr(accelerator, "is_fsdp2", False) or getattr(accelerator, "_fsdp_version_used", None) == 2
+        if use_fsdp2:
+            logger.info("[save] rank=%s gathering FSDP2 full state dict", accelerator.process_index)
+            state_dict = get_fsdp2_full_state_dict(policy, logger=logger)
+            if state_dict is None:
+                logger.warning("[save] FSDP2 full state dict failed; falling back to accelerator.get_state_dict")
+                state_dict = accelerator.get_state_dict(policy)
+        else:
+            logger.info("[save] rank=%s gathering state dict", accelerator.process_index)
+            state_dict = accelerator.get_state_dict(policy)
         logger.info("[save] rank=%s state dict gathered", accelerator.process_index)
         if accelerator.is_main_process:
             unwrapped = accelerator.unwrap_model(policy)

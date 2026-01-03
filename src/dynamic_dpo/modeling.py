@@ -238,7 +238,8 @@ def save_hf_pretrained_from_fsdp_shards(
         return None
     return output_dir
 
-
+# --- FSDP Utilities ---
+# Save FSDP sharded checkpoints via accelerate
 def save_fsdp_sharded_checkpoint(
     accelerator,
     model,
@@ -315,7 +316,7 @@ def save_fsdp_sharded_checkpoint(
                 return None
     return output_dir
 
-
+# --- HF Save Utilities ---
 def save_hf_artifacts(model, tokenizer, output_dir: str, logger: Optional[Any] = None) -> Optional[str]:
     os.makedirs(output_dir, exist_ok=True)
     if model is not None:
@@ -349,6 +350,38 @@ def save_hf_artifacts(model, tokenizer, output_dir: str, logger: Optional[Any] =
             else:
                 print(msg)
     return output_dir
+
+
+def get_fsdp2_full_state_dict(
+    model,
+    cpu_offload: bool = True,
+    broadcast_from_rank0: bool = False,
+    logger: Optional[Any] = None,
+) -> Optional[Dict[str, Any]]:
+    try:
+        from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+    except Exception as exc:
+        msg = f"fsdp2 full state dict unavailable; error={exc}"
+        if logger is not None:
+            logger.warning(msg)
+        else:
+            print(msg)
+        return None
+
+    options = StateDictOptions(
+        full_state_dict=True,
+        cpu_offload=cpu_offload,
+        broadcast_from_rank0=broadcast_from_rank0,
+    )
+    try:
+        return get_model_state_dict(model, options=options)
+    except Exception as exc:
+        msg = f"fsdp2 full state dict failed; error={exc}"
+        if logger is not None:
+            logger.warning(msg)
+        else:
+            print(msg)
+        return None
 
 
 def resolve_fsdp_shard_dir(path: Optional[str]) -> Optional[str]:
