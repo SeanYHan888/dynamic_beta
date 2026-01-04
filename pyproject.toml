@@ -10,6 +10,7 @@ dependencies = [
     "hf-transfer>=0.1.9",
     "matplotlib>=3.10.8",
     "numpy>=2.4.0",
+    "openai>=2.14.0",
     "peft>=0.18.0",
     "scipy>=1.16.3",
     "tokenizers>=0.22.1",
