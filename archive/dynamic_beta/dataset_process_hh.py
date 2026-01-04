@@ -1,7 +1,8 @@
 import torch
 from datasets import load_dataset, Dataset
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 from functools import partial
+
 
 ASSISTANT_TAG = "\n\nAssistant:"
 
@@ -186,56 +187,6 @@ def build_train_val(config, tokenizer):
     )
 
     return train_loader, val_loader
-
-# distributed dataset
-def build_train_val_distributed(config, tokenizer, rank, world_size):
-    raw_dataset = config['dataset']['dataset_name']
-    split = config['dataset']['subset']
-    val_ratio = float(config['dataset']['val_ratio'])
-    seed = int(config['dataset']['seed'])
-    max_len = int(config['dataset']['max_len'])
-    batch_size = int(config['dpo_training']['batch_size'])
-
-    num_works = int(config['dataset']['num_works'])
-
-    ds = load_dataset(raw_dataset, split=split)
-    ds_triple = build_HH_dataset(ds)
-
-    split_ds = ds_triple.train_test_split(test_size=val_ratio, seed=seed)
-    train_ds_raw, val_ds_raw = split_ds["train"], split_ds["test"]
-
-    ds_collate = partial(collate_fn, tokenizer=tokenizer, max_len=max_len)
-
-    train_sampler = DistributedSampler(
-        train_ds_raw, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False
-    )
-    val_sampler = DistributedSampler(
-        val_ds_raw, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False
-    )
-
-    train_loader = DataLoader(
-        train_ds_raw,
-        batch_size=batch_size,
-        sampler=train_sampler,
-        shuffle=False,
-        collate_fn=ds_collate,
-        pin_memory=True,
-        num_workers=num_works,
-    )
-    val_loader = DataLoader(
-        val_ds_raw,
-        batch_size=batch_size,
-        sampler=val_sampler,
-        shuffle=False,
-        collate_fn=ds_collate,
-        pin_memory=True,
-        num_workers=num_works,
-    )
-
-    return train_loader, val_loader
-
-
-
 
 
 

@@ -11,4 +11,4 @@ dynamic_dpo_model/
 .venv/
 hf_*/
 cache/
-archive/
+archive/dynamic_beta/Experiment1
