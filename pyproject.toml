@@ -20,6 +20,8 @@ dependencies = [
 
 [project.scripts]
 "training.py" = "training:train"
+"training-fsdp.py" = "package_fsdp:train"
+
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -31,5 +33,6 @@ py-modules = [
     "dataset_process_hh",
     "dpo_loss",
     "mean_and_var",
+    "package_fsdp",
     "training",
 ]
