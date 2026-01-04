@@ -162,6 +162,9 @@ def build_train_val(config, tokenizer):
     seed = int(config['dataset']['seed'])
     max_len = int(config['dataset']['max_len'])
     batch_size = int(config['dpo_training']['batch_size'])
+    num_workers = int(config['dataset'].get('num_workers', 0))
+    prefetch_factor = config['dataset'].get('prefetch_factor', 2)
+    persistent_workers = bool(config['dataset'].get('persistent_workers', True)) if num_workers > 0 else False
 
     ds = load_dataset(raw_dataset, split=split)
     ds_triple = build_HH_dataset(ds)
@@ -177,6 +180,9 @@ def build_train_val(config, tokenizer):
         shuffle=True,
         collate_fn=ds_collate,
         pin_memory=True,
+        num_workers=num_workers,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_ds_raw,
@@ -184,6 +190,9 @@ def build_train_val(config, tokenizer):
         shuffle=False,
         collate_fn=ds_collate,
         pin_memory=True,
+        num_workers=num_workers,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
 
     return train_loader, val_loader

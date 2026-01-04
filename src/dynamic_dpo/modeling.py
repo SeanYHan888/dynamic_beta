@@ -97,43 +97,58 @@ def dpo_loss(policy_chosen_log_prob, policy_rejected_log_prob, ref_chosen_log_pr
     return loss, chosen_rewards, rejected_rewards
 
 
-def compute_and_log_model_margin(model_margin, epoch_dir, epoch, step, JSONL_PATH):
+def compute_and_log_model_margin(
+    model_margin,
+    epoch_dir,
+    epoch,
+    step,
+    JSONL_PATH,
+    *,
+    save_npy: bool = True,
+    save_jsonl: bool = True,
+    sample_size: int | None = None,
+):
     """
     Log model margins to a JSONL file and save raw margins as .npy.
     """
-    # full array
-    # using numpy to process, so only on cpu
-    m = model_margin.detach().float().cpu().numpy()  
-                
-    # 1) save full margins as .npy (raw, lossless)
-    # step: batch index
-    npy_path = os.path.join(epoch_dir, f"step_{step:05d}.npy")
-    np.save(npy_path, m)
+    t = model_margin.detach().float().cpu().view(-1)
+    if t.numel() == 0:
+        return
 
-    # 2) write a readable per-batch record to ONE jsonl file
-    # summary stats
-    # quantiles
-    p10, p50, p90 = np.percentile(m, [10, 50, 90])
-                
+    if sample_size is None:
+        sample_size = int(t.numel())
+    else:
+        sample_size = max(0, min(int(sample_size), int(t.numel())))
+
+    # Stats on CPU tensor to avoid numpy conversion unless we actually save npy.
+    p10, p50, p90 = torch.quantile(t, torch.tensor([0.1, 0.5, 0.9])).tolist()
     record = {
         "epoch": int(epoch),
         "step": int(step),
-        "batch_size": int(m.shape[0]),
-        "mean": float(m.mean()),
-        "std": float(m.std(ddof=0)),
-        "min": float(m.min()),
+        "batch_size": int(t.numel()),
+        "mean": float(t.mean().item()),
+        "std": float(t.std(unbiased=False).item()),
+        "min": float(t.min().item()),
         "p10": float(p10),
         "median": float(p50),
         "p90": float(p90),
-        "max": float(m.max()),
-        "pos_frac": float((m > 0).mean()),
-        "npy": npy_path,
-        "sample": [float(x) for x in m[:]],
+        "max": float(t.max().item()),
+        "pos_frac": float((t > 0).float().mean().item()),
     }
 
-    # save in the jsonl file       
-    with open(JSONL_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    npy_path = None
+    if save_npy:
+        # step: batch index
+        npy_path = os.path.join(epoch_dir, f"step_{step:05d}.npy")
+        np.save(npy_path, t.numpy())
+        record["npy"] = npy_path
+
+    if sample_size > 0:
+        record["sample"] = [float(x) for x in t[:sample_size].tolist()]
+
+    if save_jsonl:
+        with open(JSONL_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 # --- Stats & Risk Utilities ---

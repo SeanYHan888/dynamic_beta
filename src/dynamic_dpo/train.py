@@ -56,7 +56,7 @@ def load_yaml_config(path: str) -> Dict[str, Any]:
         return yaml.safe_load(f)
 
 def to_device_batch(batch: Dict[str, Any], device: str) -> Dict[str, Any]:
-    return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+    return {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
 def seed_everything(seed: int = 42):
     torch.manual_seed(seed)
@@ -231,6 +231,12 @@ def train(config_path: str, mode: str = "dynamic"):
         os.makedirs(LOG_DIR, exist_ok=True)
     accelerator.wait_for_everyone()
     JSONL_PATH = os.path.join(LOG_DIR, "margins_log.jsonl")
+    margin_log_cfg = config.get("margin_log", {})
+    margin_log_enabled = bool(margin_log_cfg.get("enabled", True))
+    margin_log_every = max(1, int(margin_log_cfg.get("every_steps", 1)))
+    margin_log_save_npy = bool(margin_log_cfg.get("save_npy", True))
+    margin_log_save_jsonl = bool(margin_log_cfg.get("save_jsonl", True))
+    margin_log_sample_size = margin_log_cfg.get("sample_size", None)
 
     # Dynamic DPO specific setup
     is_dynamic = (mode == 'dynamic')
@@ -252,7 +258,8 @@ def train(config_path: str, mode: str = "dynamic"):
         beta_min = float(config['beta_update']['beta_min'])
         if beta_min <= 0.0:
             # If beta reaches 0, DPO gradients become exactly 0 and training will appear frozen.
-            logger.warning("beta_min<=0 will zero gradients if beta hits 0; clamping beta_min to 1e-6.")
+            if accelerator.is_main_process:
+                logger.warning("beta_min<=0 will zero gradients if beta hits 0; clamping beta_min to 1e-6.")
             beta_min = 1e-6
         
         beta = beta_0 # start with beta_0
@@ -406,13 +413,17 @@ def train(config_path: str, mode: str = "dynamic"):
                     if is_dynamic and global_margins is not None:
                         # Log global margins to reflect true distributed batch stats.
                         margins_for_logging = global_margins
-                    compute_and_log_model_margin(
-                        model_margin=margins_for_logging,
-                        epoch_dir=epoch_dir,
-                        epoch=epoch,
-                        step=step,
-                        JSONL_PATH=JSONL_PATH
-                    )
+                    if margin_log_enabled and (step % margin_log_every == 0):
+                        compute_and_log_model_margin(
+                            model_margin=margins_for_logging,
+                            epoch_dir=epoch_dir,
+                            epoch=epoch,
+                            step=step,
+                            JSONL_PATH=JSONL_PATH,
+                            save_npy=margin_log_save_npy,
+                            save_jsonl=margin_log_save_jsonl,
+                            sample_size=margin_log_sample_size,
+                        )
 
                 loss_raw, chosen_rewards, rejected_rewards = dpo_loss(
                     policy_chosen_log_prob, policy_rejected_log_prob, ref_chosen_log_prob, ref_rejected_log_prob, beta=beta_used
