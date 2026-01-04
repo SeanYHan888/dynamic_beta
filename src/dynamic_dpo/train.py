@@ -1,16 +1,25 @@
-import torch
-from torch.optim import AdamW
 import argparse
-import numpy as np
-import yaml
-from tqdm import tqdm
-import random
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import wandb
 import os
+import random
+import sys
 import json
 import logging
 from typing import Dict, Any
+
+import torch
+from torch.optim import AdamW
+import numpy as np
+import yaml
+from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import wandb
+
+if __package__ is None or __package__ == "":
+    # Support running this file directly without installing the package.
+    repo_src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if repo_src not in sys.path:
+        sys.path.append(repo_src)
+    __package__ = "dynamic_dpo"
 
 from .data import build_train_val
 from .modeling import (
