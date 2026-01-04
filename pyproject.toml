@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.scripts]
-training.py = "training:train"
+"training.py" = "training:train"
 
 [build-system]
 requires = ["setuptools>=68"]
