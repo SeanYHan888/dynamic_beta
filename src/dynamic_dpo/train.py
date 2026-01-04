@@ -544,8 +544,8 @@ def train(config_path: str, mode: str = "dynamic"):
                     'model_margin': avg_model_margin.item(),
                     'beta': beta_used,
                     'grad_norm': float(grad_norm) if grad_norm is not None else None,
-                    'examples_per_step_global': examples_per_step_global,
-                    'examples_per_sec_global': examples_per_sec_global,
+                    'performance/examples_per_step_global': examples_per_step_global,
+                    'performance/examples_per_sec_global': examples_per_sec_global,
                 }
                 if profile_timing:
                     timing = torch.tensor(
@@ -557,10 +557,10 @@ def train(config_path: str, mode: str = "dynamic"):
                         dist.all_reduce(timing, op=dist.ReduceOp.MAX)
                     log_payload.update(
                         {
-                            "time_data_s_per_step_max": float(timing[0].item()) / float(log_steps),
-                            "time_fwd_s_per_step_max": float(timing[1].item()) / float(log_steps),
-                            "time_bwd_s_per_step_max": float(timing[2].item()) / float(log_steps),
-                            "time_total_s_per_step_max": float(elapsed) / float(log_steps),
+                            "performance/time_data_s_per_step_max": float(timing[0].item()) / float(log_steps),
+                            "performance/time_fwd_s_per_step_max": float(timing[1].item()) / float(log_steps),
+                            "performance/time_bwd_s_per_step_max": float(timing[2].item()) / float(log_steps),
+                            "performance/time_total_s_per_step_max": float(elapsed) / float(log_steps),
                         }
                     )
                 if param_delta_mean is not None:
