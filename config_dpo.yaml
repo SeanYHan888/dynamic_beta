@@ -10,6 +10,7 @@ fsdp:
 dataset:
   dataset_name: Anthropic/hh-rlhf
   subset: train[:20%]
+  num_workers: 0
   val_ratio: 0.1
   seed: 42
   max_len: 512
@@ -49,6 +50,7 @@ beta_update:
   beta_min: 1e-8
 
 margin_log:
+  enabled: false
   log_dir: logs/margins
   dpo_log_dir: logs/dpo_margins
 
