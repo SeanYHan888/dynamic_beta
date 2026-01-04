@@ -145,16 +145,31 @@ def train(config_path: str, mode: str = "dynamic"):
 
     fsdp_plugin = None
     if fsdp_enabled:
-        fsdp_plugin = FullyShardedDataParallelPlugin(
-            state_dict_config=FullStateDictConfig(
+        import inspect
+
+        fsdp_kwargs = {
+            "state_dict_config": FullStateDictConfig(
                 offload_to_cpu=fsdp_state_offload,
-                rank0_only=fsdp_rank0_only
+                rank0_only=fsdp_rank0_only,
             ),
-            optim_state_dict_config=FullOptimStateDictConfig(
+            "optim_state_dict_config": FullOptimStateDictConfig(
                 offload_to_cpu=fsdp_state_offload,
-                rank0_only=fsdp_rank0_only
+                rank0_only=fsdp_rank0_only,
             ),
-        )
+        }
+        # Compatibility knobs: only pass when supported by the installed accelerate.
+        plugin_sig = None
+        try:
+            plugin_sig = inspect.signature(FullyShardedDataParallelPlugin.__init__)
+        except Exception:
+            plugin_sig = None
+        if plugin_sig is not None:
+            if "use_orig_params" in plugin_sig.parameters:
+                fsdp_kwargs["use_orig_params"] = bool(fsdp_cfg.get("use_orig_params", True))
+            if "sync_module_states" in plugin_sig.parameters:
+                fsdp_kwargs["sync_module_states"] = bool(fsdp_cfg.get("sync_module_states", True))
+
+        fsdp_plugin = FullyShardedDataParallelPlugin(**fsdp_kwargs)
     accelerator = Accelerator(
         fsdp_plugin=fsdp_plugin,
         mixed_precision="bf16" if use_bf16 else "no",
@@ -186,17 +201,17 @@ def train(config_path: str, mode: str = "dynamic"):
     ref_model = AutoModelForCausalLM.from_pretrained(ref_name)
     ref_model.config.pad_token_id = tok.pad_token_id
     ref_model.requires_grad_(False)
-    
-    optimizer = AdamW(params=policy.parameters(), lr=float(config['dpo_training']['learning_rate']))
 
     if use_bf16:
         policy.to(dtype=torch.bfloat16)
         ref_model.to(dtype=torch.bfloat16)
 
     train_loader, val_loader = build_train_val(config=config, tokenizer=tok)
-    policy, optimizer, train_loader, val_loader = accelerator.prepare(
-        policy, optimizer, train_loader, val_loader
-    )
+    # Important for FSDP: create the optimizer *after* `accelerator.prepare(policy, ...)`.
+    # Otherwise the optimizer can hold references to pre-FSDP parameters and silently stop updating.
+    policy, train_loader, val_loader = accelerator.prepare(policy, train_loader, val_loader)
+    optimizer = AdamW(params=policy.parameters(), lr=float(config['dpo_training']['learning_rate']))
+    optimizer = accelerator.prepare(optimizer)
     ref_model.to(device)
 
     policy.train()
@@ -232,6 +247,10 @@ def train(config_path: str, mode: str = "dynamic"):
         beta_0 = float(config['beta_update']['beta_0'])
         beta_max = float(config['beta_update']['beta_max'])
         beta_min = float(config['beta_update']['beta_min'])
+        if beta_min <= 0.0:
+            # If beta reaches 0, DPO gradients become exactly 0 and training will appear frozen.
+            logger.warning("beta_min<=0 will zero gradients if beta hits 0; clamping beta_min to 1e-6.")
+            beta_min = 1e-6
         
         beta = beta_0 # start with beta_0
         
@@ -254,6 +273,15 @@ def train(config_path: str, mode: str = "dynamic"):
     log_steps = config['dpo_training']['log_steps']
     global_steps = 0
     max_grad_norm = float(config['dpo_training']['max_grad_norm'])
+    debug_cfg = config.get("debug", {})
+    debug_log_updates = bool(debug_cfg.get("log_param_updates", False))
+    debug_param_n = int(debug_cfg.get("param_update_n", 1024))
+    debug_param = None
+    if debug_log_updates and accelerator.is_main_process:
+        try:
+            debug_param = next(iter(policy.parameters()))
+        except StopIteration:
+            debug_param = None
 
     for epoch in range(epochs):
         epoch_dir = os.path.join(LOG_DIR, f"epoch_{epoch:03d}")
@@ -270,9 +298,16 @@ def train(config_path: str, mode: str = "dynamic"):
         )
         
         running_loss = 0.0
+        param_before = None
         
         for step, batch in pbar:
             batch = to_device_batch(batch, device)
+
+            if debug_param is not None and accelerator.is_main_process and (step + 1) % log_steps == 0:
+                with torch.no_grad():
+                    flat = debug_param.detach().float().view(-1)
+                    n = min(int(flat.numel()), max(1, debug_param_n))
+                    param_before = flat[:n].cpu()
 
             with accelerator.autocast():
                 policy_chosen_log_prob, policy_rejected_log_prob, ref_chosen_log_prob, ref_rejected_log_prob = compute_batch_log_prob(
@@ -390,7 +425,7 @@ def train(config_path: str, mode: str = "dynamic"):
             
             # Dynamic often clips grad only after warmup, but static usually always clips. 
            
-            accelerator.clip_grad_norm_(policy.parameters(), max_norm=max_grad_norm)
+            grad_norm = accelerator.clip_grad_norm_(policy.parameters(), max_norm=max_grad_norm)
             optimizer.step()
             
             global_steps += 1 
@@ -399,13 +434,23 @@ def train(config_path: str, mode: str = "dynamic"):
             if accelerator.is_main_process and (step + 1) % log_steps == 0:
                 avg_loss = running_loss / log_steps
                 pbar.set_postfix(loss=f"{avg_loss:.3f}")
+                param_delta_mean = None
+                if debug_param is not None and param_before is not None:
+                    with torch.no_grad():
+                        flat = debug_param.detach().float().view(-1)
+                        n = min(int(flat.numel()), param_before.numel())
+                        after = flat[:n].cpu()
+                        param_delta_mean = (after - param_before).abs().mean().item()
                 log_payload = {
                     'loss': avg_loss,
                     'chosen_rewards': avg_chosen_rewards.item(),
                     'rejected_rewards': avg_rejected_rewards.item(),
                     'model_margin': avg_model_margin.item(),
-                    'beta': beta_used
+                    'beta': beta_used,
+                    'grad_norm': float(grad_norm) if grad_norm is not None else None,
                 }
+                if param_delta_mean is not None:
+                    log_payload["param_delta_mean_abs"] = float(param_delta_mean)
                 if is_dynamic and tau_for_log is not None:
                     log_payload['tau'] = tau_for_log
                 wandb.log(log_payload)
