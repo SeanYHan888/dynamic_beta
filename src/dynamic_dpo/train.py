@@ -307,7 +307,8 @@ def train(config_path: str, mode: str = "dynamic"):
             disable=not accelerator.is_main_process,
         )
         
-        running_loss = 0.0
+        running_loss_sum = 0.0
+        running_loss_count = 0
         param_before = None
         
         for step, batch in pbar:
@@ -433,6 +434,8 @@ def train(config_path: str, mode: str = "dynamic"):
                 avg_chosen_rewards = chosen_rewards.mean()
                 avg_rejected_rewards = rejected_rewards.mean()
                 avg_model_margin = model_margin.mean()
+                batch_loss_sum = float(loss_raw.detach().float().sum().item())
+                batch_loss_count = int(loss_raw.numel())
 
             optimizer.zero_grad()
             accelerator.backward(loss)
@@ -443,11 +446,22 @@ def train(config_path: str, mode: str = "dynamic"):
             optimizer.step()
             
             global_steps += 1 
-            running_loss += loss.item()
+            running_loss_sum += batch_loss_sum
+            running_loss_count += batch_loss_count
             
-            if accelerator.is_main_process and (step + 1) % log_steps == 0:
-                avg_loss = running_loss / log_steps
-                pbar.set_postfix(loss=f"{avg_loss:.3f}")
+            if (step + 1) % log_steps == 0:
+                avg_loss_local = running_loss_sum / max(1.0, float(running_loss_count))
+                totals = torch.tensor(
+                    [running_loss_sum, float(running_loss_count)],
+                    device=device,
+                    dtype=torch.float64,
+                )
+                if dist.is_available() and dist.is_initialized() and accelerator.num_processes > 1:
+                    dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+                avg_loss_global = float(totals[0].item()) / max(1.0, float(totals[1].item()))
+
+                if accelerator.is_main_process:
+                    pbar.set_postfix(loss=f"{avg_loss_global:.3f}")
                 param_delta_mean = None
                 if debug_param is not None and param_before is not None:
                     with torch.no_grad():
@@ -456,7 +470,8 @@ def train(config_path: str, mode: str = "dynamic"):
                         after = flat[:n].cpu()
                         param_delta_mean = (after - param_before).abs().mean().item()
                 log_payload = {
-                    'loss': avg_loss,
+                    'loss': avg_loss_global,
+                    'loss_local_rank0': avg_loss_local,
                     'chosen_rewards': avg_chosen_rewards.item(),
                     'rejected_rewards': avg_rejected_rewards.item(),
                     'model_margin': avg_model_margin.item(),
@@ -467,8 +482,10 @@ def train(config_path: str, mode: str = "dynamic"):
                     log_payload["param_delta_mean_abs"] = float(param_delta_mean)
                 if is_dynamic and tau_for_log is not None:
                     log_payload['tau'] = tau_for_log
-                wandb.log(log_payload)
-                running_loss = 0.0
+                if accelerator.is_main_process:
+                    wandb.log(log_payload)
+                running_loss_sum = 0.0
+                running_loss_count = 0
 
         eval_metrics = evaluate(policy, ref_model, val_loader, beta=beta_used, accelerator=accelerator)
         if accelerator.is_main_process:
