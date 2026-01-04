@@ -224,7 +224,11 @@ def train(config_path: str, mode: str = "dynamic"):
         tok.pad_token = tok.eos_token
         tok.pad_token_id = tok.eos_token_id
 
-    ref_model = AutoModelForCausalLM.from_pretrained(ref_name)
+    # Load ref model in the compute dtype to reduce activation memory 
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        ref_name,
+        torch_dtype=torch.bfloat16 if use_bf16 else None,
+    )
     ref_model.config.pad_token_id = tok.pad_token_id
     ref_model.requires_grad_(False)
 
@@ -325,6 +329,8 @@ def train(config_path: str, mode: str = "dynamic"):
     debug_cfg = config.get("debug", {})
     debug_log_updates = bool(debug_cfg.get("log_param_updates", False))
     debug_param_n = int(debug_cfg.get("param_update_n", 1024))
+    profile_cfg = config.get("profile", {})
+    profile_timing = bool(profile_cfg.get("timing", False))
     debug_param = None
     if debug_log_updates and accelerator.is_main_process:
         try:
@@ -350,9 +356,15 @@ def train(config_path: str, mode: str = "dynamic"):
         running_loss_sum = 0.0
         running_loss_count = 0
         param_before = None
+        time_data_s = 0.0
+        time_fwd_s = 0.0
+        time_bwd_s = 0.0
         
         for step, batch in pbar:
+            step_t0 = time.perf_counter()
             batch = to_device_batch(batch, device)
+            if profile_timing:
+                time_data_s += time.perf_counter() - step_t0
 
             if debug_param is not None and accelerator.is_main_process and (step + 1) % log_steps == 0:
                 with torch.no_grad():
@@ -360,6 +372,7 @@ def train(config_path: str, mode: str = "dynamic"):
                     n = min(int(flat.numel()), max(1, debug_param_n))
                     param_before = flat[:n].cpu()
 
+            fwd_t0 = time.perf_counter()
             with accelerator.autocast():
                 policy_chosen_log_prob, policy_rejected_log_prob, ref_chosen_log_prob, ref_rejected_log_prob = compute_batch_log_prob(
                     batch, policy=policy, ref_model=ref_model
@@ -476,14 +489,21 @@ def train(config_path: str, mode: str = "dynamic"):
                 avg_model_margin = model_margin.mean()
                 batch_loss_sum = float(loss_raw.detach().float().sum().item())
                 batch_loss_count = int(loss_raw.numel())
+            if profile_timing:
+                time_fwd_s += time.perf_counter() - fwd_t0
 
+            bwd_t0 = time.perf_counter()
             optimizer.zero_grad()
             accelerator.backward(loss)
             
             # Dynamic often clips grad only after warmup, but static usually always clips. 
            
-            grad_norm = accelerator.clip_grad_norm_(policy.parameters(), max_norm=max_grad_norm)
+            grad_norm = None
+            if max_grad_norm and max_grad_norm > 0:
+                grad_norm = accelerator.clip_grad_norm_(policy.parameters(), max_norm=max_grad_norm)
             optimizer.step()
+            if profile_timing:
+                time_bwd_s += time.perf_counter() - bwd_t0
             
             global_steps += 1 
             running_loss_sum += batch_loss_sum
@@ -527,6 +547,22 @@ def train(config_path: str, mode: str = "dynamic"):
                     'examples_per_step_global': examples_per_step_global,
                     'examples_per_sec_global': examples_per_sec_global,
                 }
+                if profile_timing:
+                    timing = torch.tensor(
+                        [time_data_s, time_fwd_s, time_bwd_s],
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                    if dist.is_available() and dist.is_initialized() and accelerator.num_processes > 1:
+                        dist.all_reduce(timing, op=dist.ReduceOp.MAX)
+                    log_payload.update(
+                        {
+                            "time_data_s_per_step_max": float(timing[0].item()) / float(log_steps),
+                            "time_fwd_s_per_step_max": float(timing[1].item()) / float(log_steps),
+                            "time_bwd_s_per_step_max": float(timing[2].item()) / float(log_steps),
+                            "time_total_s_per_step_max": float(elapsed) / float(log_steps),
+                        }
+                    )
                 if param_delta_mean is not None:
                     log_payload["param_delta_mean_abs"] = float(param_delta_mean)
                 if is_dynamic and tau_for_log is not None:
@@ -536,6 +572,9 @@ def train(config_path: str, mode: str = "dynamic"):
                 running_loss_sum = 0.0
                 running_loss_count = 0
                 window_start_t = time.perf_counter()
+                time_data_s = 0.0
+                time_fwd_s = 0.0
+                time_bwd_s = 0.0
 
         eval_metrics = evaluate(policy, ref_model, val_loader, beta=beta_used, accelerator=accelerator)
         if accelerator.is_main_process:
