@@ -203,7 +203,10 @@ def train(config_path: str, mode: str = "dynamic"):
     ref_model.requires_grad_(False)
 
     if use_bf16:
-        policy.to(dtype=torch.bfloat16)
+        # With FSDP mixed precision, keep policy weights in full precision and let FSDP/autocast handle compute dtype.
+        # Pre-casting the model to bf16 triggers accelerate's "upcasted low precision parameters" warning.
+        if not fsdp_enabled:
+            policy.to(dtype=torch.bfloat16)
         ref_model.to(dtype=torch.bfloat16)
 
     train_loader, val_loader = build_train_val(config=config, tokenizer=tok)

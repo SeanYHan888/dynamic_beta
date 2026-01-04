@@ -19,7 +19,7 @@ dpo_training:
   batch_size: 16
   learning_rate: 5e-7
   log_steps: 10
-  warmup_steps: 120
+  warmup_steps: 20
   max_grad_norm: 10
   save_dpo_dir: dpo_model
   save_dir: dynamic_dpo_model
@@ -46,7 +46,7 @@ beta_update:
   gamma: 2.0
   alpha: 0.0015
   beta_max: 2.0
-  beta_min: 0.0
+  beta_min: 1e-8
 
 margin_log:
   log_dir: logs/margins
