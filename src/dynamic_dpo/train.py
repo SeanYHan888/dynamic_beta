@@ -14,6 +14,7 @@ import wandb
 import os
 import json
 import logging
+import time
 from typing import Dict, Any
 
 try:
@@ -137,16 +138,16 @@ def train(config_path: str, mode: str = "dynamic"):
     """
     config = load_yaml_config(config_path)
     use_bf16 = config['precision'] == 'bf16'
+    import inspect
 
     fsdp_cfg = config.get('fsdp', {})
     fsdp_enabled = bool(fsdp_cfg.get('enabled', True))
     fsdp_state_offload = bool(fsdp_cfg.get('state_dict_offload', True))
     fsdp_rank0_only = bool(fsdp_cfg.get('save_on_rank0_only', True))
+    fsdp_shard_ref_model = bool(fsdp_cfg.get("shard_ref_model", False))
 
     fsdp_plugin = None
     if fsdp_enabled:
-        import inspect
-
         fsdp_kwargs = {
             "state_dict_config": FullStateDictConfig(
                 offload_to_cpu=fsdp_state_offload,
@@ -170,11 +171,36 @@ def train(config_path: str, mode: str = "dynamic"):
                 fsdp_kwargs["sync_module_states"] = bool(fsdp_cfg.get("sync_module_states", True))
 
         fsdp_plugin = FullyShardedDataParallelPlugin(**fsdp_kwargs)
+
+    accel_cfg = config.get("accelerate", {})
+    accel_kwargs: Dict[str, Any] = {}
+    try:
+        accel_sig = inspect.signature(Accelerator.__init__)
+    except Exception:
+        accel_sig = None
+    if accel_sig is not None:
+        if "split_batches" in accel_sig.parameters:
+            # If True, accelerate will split each batch across ranks => global batch stays constant (often slower for small batches).
+            accel_kwargs["split_batches"] = bool(accel_cfg.get("split_batches", False))
+        if "dispatch_batches" in accel_sig.parameters and "dispatch_batches" in accel_cfg:
+            # If True, only rank0 builds batches and dispatches them to other ranks (can bottleneck on CPU/tokenization).
+            accel_kwargs["dispatch_batches"] = bool(accel_cfg.get("dispatch_batches"))
+        if "even_batches" in accel_sig.parameters and "even_batches" in accel_cfg:
+            accel_kwargs["even_batches"] = bool(accel_cfg.get("even_batches"))
+
     accelerator = Accelerator(
         fsdp_plugin=fsdp_plugin,
         mixed_precision="bf16" if use_bf16 else "no",
+        **accel_kwargs,
     )
     device = accelerator.device
+    if accelerator.is_main_process:
+        logger.info(
+            "accelerate: num_processes=%s split_batches=%s dispatch_batches=%s",
+            accelerator.num_processes,
+            getattr(accelerator, "split_batches", None),
+            getattr(accelerator, "dispatch_batches", None),
+        )
 
     seed_everything(config['dataset'].get('seed', 42))
 
@@ -207,15 +233,28 @@ def train(config_path: str, mode: str = "dynamic"):
         # Pre-casting the model to bf16 triggers accelerate's "upcasted low precision parameters" warning.
         if not fsdp_enabled:
             policy.to(dtype=torch.bfloat16)
-        ref_model.to(dtype=torch.bfloat16)
+        if not (fsdp_enabled and fsdp_shard_ref_model):
+            ref_model.to(dtype=torch.bfloat16)
 
     train_loader, val_loader = build_train_val(config=config, tokenizer=tok)
     # Important for FSDP: create the optimizer *after* `accelerator.prepare(policy, ...)`.
     # Otherwise the optimizer can hold references to pre-FSDP parameters and silently stop updating.
-    policy, train_loader, val_loader = accelerator.prepare(policy, train_loader, val_loader)
+    if fsdp_enabled and fsdp_shard_ref_model:
+        policy, ref_model, train_loader, val_loader = accelerator.prepare(policy, ref_model, train_loader, val_loader)
+        ref_model.requires_grad_(False)
+    else:
+        policy, train_loader, val_loader = accelerator.prepare(policy, train_loader, val_loader)
+    if accelerator.is_main_process:
+        logger.info("dataloader types: train=%s val=%s", type(train_loader).__name__, type(val_loader).__name__)
+        if accelerator.num_processes > 1 and getattr(accelerator, "split_batches", False):
+            logger.warning(
+                "accelerate split_batches=True => per-rank batch is smaller and global batch may stay constant; "
+                "this often makes multi-GPU slower for small batches. Consider `accelerate.split_batches: false`."
+            )
     optimizer = AdamW(params=policy.parameters(), lr=float(config['dpo_training']['learning_rate']))
     optimizer = accelerator.prepare(optimizer)
-    ref_model.to(device)
+    if not (fsdp_enabled and fsdp_shard_ref_model):
+        ref_model.to(device)
 
     policy.train()
     ref_model.eval()
@@ -307,6 +346,7 @@ def train(config_path: str, mode: str = "dynamic"):
             disable=not accelerator.is_main_process,
         )
         
+        window_start_t = time.perf_counter()
         running_loss_sum = 0.0
         running_loss_count = 0
         param_before = None
@@ -450,6 +490,7 @@ def train(config_path: str, mode: str = "dynamic"):
             running_loss_count += batch_loss_count
             
             if (step + 1) % log_steps == 0:
+                elapsed = time.perf_counter() - window_start_t
                 avg_loss_local = running_loss_sum / max(1.0, float(running_loss_count))
                 totals = torch.tensor(
                     [running_loss_sum, float(running_loss_count)],
@@ -458,7 +499,13 @@ def train(config_path: str, mode: str = "dynamic"):
                 )
                 if dist.is_available() and dist.is_initialized() and accelerator.num_processes > 1:
                     dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+                    elapsed_t = torch.tensor([elapsed], device=device, dtype=torch.float64)
+                    dist.all_reduce(elapsed_t, op=dist.ReduceOp.MAX)
+                    elapsed = float(elapsed_t.item())
                 avg_loss_global = float(totals[0].item()) / max(1.0, float(totals[1].item()))
+                examples_global = float(totals[1].item())
+                examples_per_step_global = examples_global / float(log_steps)
+                examples_per_sec_global = examples_global / max(1e-12, elapsed)
 
                 if accelerator.is_main_process:
                     pbar.set_postfix(loss=f"{avg_loss_global:.3f}")
@@ -477,6 +524,8 @@ def train(config_path: str, mode: str = "dynamic"):
                     'model_margin': avg_model_margin.item(),
                     'beta': beta_used,
                     'grad_norm': float(grad_norm) if grad_norm is not None else None,
+                    'examples_per_step_global': examples_per_step_global,
+                    'examples_per_sec_global': examples_per_sec_global,
                 }
                 if param_delta_mean is not None:
                     log_payload["param_delta_mean_abs"] = float(param_delta_mean)
@@ -486,6 +535,7 @@ def train(config_path: str, mode: str = "dynamic"):
                     wandb.log(log_payload)
                 running_loss_sum = 0.0
                 running_loss_count = 0
+                window_start_t = time.perf_counter()
 
         eval_metrics = evaluate(policy, ref_model, val_loader, beta=beta_used, accelerator=accelerator)
         if accelerator.is_main_process:

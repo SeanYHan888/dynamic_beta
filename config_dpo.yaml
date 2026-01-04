@@ -6,6 +6,7 @@ fsdp:
   enabled: true
   state_dict_offload: true
   save_on_rank0_only: true
+  shard_ref_model: true
 
 dataset:
   dataset_name: Anthropic/hh-rlhf

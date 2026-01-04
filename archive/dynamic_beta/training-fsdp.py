@@ -223,12 +223,14 @@ def train():
     policy = fsdp_wrap(policy, use_bf16=use_bf16)
     policy.train()
 
-    # ref model: no grad, keep as normal model on each GPU
+    # ref model: no grad, shard with FSDP as well (do NOT .to(device) before FSDP)
     ref_model = AutoModelForCausalLM.from_pretrained(
         ref_name,
         torch_dtype=torch.bfloat16 if use_bf16 else torch.float32,
-    ).to(device)
+    )
     ref_model.config.pad_token_id = tok.pad_token_id
+    ref_model.requires_grad_(False)
+    ref_model = fsdp_wrap(ref_model, use_bf16=use_bf16)
     ref_model.requires_grad_(False)
     ref_model.eval()
 
