@@ -1,6 +1,7 @@
 import torch
 from datasets import load_dataset, Dataset
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from functools import partial
 
 
@@ -155,7 +156,7 @@ def collate_fn(batch, tokenizer, max_len):
     }
 
 # build train, eval dataloader
-def build_train_val(config, tokenizer):
+def build_train_val(config, tokenizer, accelerator=None):
     raw_dataset = config['dataset']['dataset_name']
     split = config['dataset']['subset']
     val_ratio = float(config['dataset']['val_ratio'])
@@ -174,10 +175,25 @@ def build_train_val(config, tokenizer):
 
     ds_collate = partial(collate_fn, tokenizer=tokenizer, max_len=max_len)
 
+    train_sampler = None
+    val_sampler = None
+    train_shuffle = True
+    if accelerator is not None and getattr(accelerator, "num_processes", 1) > 1:
+        world_size = int(accelerator.num_processes)
+        rank = int(getattr(accelerator, "process_index", 0))
+        train_sampler = DistributedSampler(
+            train_ds_raw, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False
+        )
+        val_sampler = DistributedSampler(
+            val_ds_raw, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False
+        )
+        train_shuffle = False
+
     train_loader = DataLoader(
         train_ds_raw,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=train_shuffle,
+        sampler=train_sampler,
         collate_fn=ds_collate,
         pin_memory=True,
         num_workers=num_workers,
@@ -188,6 +204,7 @@ def build_train_val(config, tokenizer):
         val_ds_raw,
         batch_size=batch_size,
         shuffle=False,
+        sampler=val_sampler,
         collate_fn=ds_collate,
         pin_memory=True,
         num_workers=num_workers,

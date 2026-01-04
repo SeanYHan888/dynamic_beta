@@ -8,7 +8,15 @@ from tqdm import tqdm
 import random
 from functools import partial
 from accelerate import Accelerator, FullyShardedDataParallelPlugin
-from torch.distributed.fsdp import FullStateDictConfig, FullOptimStateDictConfig
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    FullStateDictConfig,
+    FullOptimStateDictConfig,
+    MixedPrecision,
+    ShardingStrategy,
+    StateDictType,
+)
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import wandb
 import os
@@ -147,6 +155,7 @@ def train(config_path: str, mode: str = "dynamic"):
     fsdp_shard_ref_model = bool(fsdp_cfg.get("shard_ref_model", False))
 
     fsdp_plugin = None
+    fsdp_missing_params: list[str] = []
     if fsdp_enabled:
         fsdp_kwargs = {
             "state_dict_config": FullStateDictConfig(
@@ -165,10 +174,31 @@ def train(config_path: str, mode: str = "dynamic"):
         except Exception:
             plugin_sig = None
         if plugin_sig is not None:
+            # Enforce native FSDP settings to match `archive/dynamic_beta/training-fsdp.py`.
+            if "sharding_strategy" in plugin_sig.parameters:
+                fsdp_kwargs["sharding_strategy"] = ShardingStrategy.FULL_SHARD
+            else:
+                fsdp_missing_params.append("sharding_strategy")
+            if "mixed_precision_policy" in plugin_sig.parameters:
+                mp = MixedPrecision(
+                    param_dtype=torch.bfloat16 if use_bf16 else torch.float32,
+                    reduce_dtype=torch.float32,
+                    buffer_dtype=torch.bfloat16 if use_bf16 else torch.float32,
+                )
+                fsdp_kwargs["mixed_precision_policy"] = mp
+            else:
+                fsdp_missing_params.append("mixed_precision_policy")
+            if "auto_wrap_policy" in plugin_sig.parameters:
+                min_num_params = int(fsdp_cfg.get("min_num_params", int(1e7)))
+                fsdp_kwargs["auto_wrap_policy"] = partial(size_based_auto_wrap_policy, min_num_params=min_num_params)
+            else:
+                fsdp_missing_params.append("auto_wrap_policy")
             if "use_orig_params" in plugin_sig.parameters:
                 fsdp_kwargs["use_orig_params"] = bool(fsdp_cfg.get("use_orig_params", True))
             if "sync_module_states" in plugin_sig.parameters:
                 fsdp_kwargs["sync_module_states"] = bool(fsdp_cfg.get("sync_module_states", True))
+        else:
+            fsdp_missing_params = ["sharding_strategy", "mixed_precision_policy", "auto_wrap_policy"]
 
         fsdp_plugin = FullyShardedDataParallelPlugin(**fsdp_kwargs)
 
@@ -180,8 +210,8 @@ def train(config_path: str, mode: str = "dynamic"):
         accel_sig = None
     if accel_sig is not None:
         if "split_batches" in accel_sig.parameters:
-            # If True, accelerate will split each batch across ranks => global batch stays constant (often slower for small batches).
-            accel_kwargs["split_batches"] = bool(accel_cfg.get("split_batches", False))
+            # Enforce global batch = (per-rank batch_size) * (num_processes).
+            accel_kwargs["split_batches"] = False
         if "dispatch_batches" in accel_sig.parameters and "dispatch_batches" in accel_cfg:
             # If True, only rank0 builds batches and dispatches them to other ranks (can bottleneck on CPU/tokenization).
             accel_kwargs["dispatch_batches"] = bool(accel_cfg.get("dispatch_batches"))
@@ -201,6 +231,11 @@ def train(config_path: str, mode: str = "dynamic"):
             getattr(accelerator, "split_batches", None),
             getattr(accelerator, "dispatch_batches", None),
         )
+        if fsdp_enabled and fsdp_missing_params:
+            logger.warning(
+                "accelerate FSDP plugin does not expose %s; cannot fully enforce wrap/mixed-precision/sharding parity.",
+                fsdp_missing_params,
+            )
 
     seed_everything(config['dataset'].get('seed', 42))
 
@@ -215,7 +250,10 @@ def train(config_path: str, mode: str = "dynamic"):
     # Load models
     policy_name = config['policy_name']
     ref_name = config['ref_name']
-    policy = AutoModelForCausalLM.from_pretrained(policy_name)
+    policy = AutoModelForCausalLM.from_pretrained(
+        policy_name,
+        torch_dtype=torch.bfloat16 if use_bf16 else None,
+    )
     tok = AutoTokenizer.from_pretrained(policy_name)
     policy.config.pad_token_id = tok.pad_token_id
 
@@ -232,33 +270,39 @@ def train(config_path: str, mode: str = "dynamic"):
     ref_model.config.pad_token_id = tok.pad_token_id
     ref_model.requires_grad_(False)
 
-    if use_bf16:
-        # With FSDP mixed precision, keep policy weights in full precision and let FSDP/autocast handle compute dtype.
-        # Pre-casting the model to bf16 triggers accelerate's "upcasted low precision parameters" warning.
-        if not fsdp_enabled:
-            policy.to(dtype=torch.bfloat16)
-        if not (fsdp_enabled and fsdp_shard_ref_model):
-            ref_model.to(dtype=torch.bfloat16)
+    train_loader, val_loader = build_train_val(config=config, tokenizer=tok, accelerator=accelerator)
 
-    train_loader, val_loader = build_train_val(config=config, tokenizer=tok)
-    # Important for FSDP: create the optimizer *after* `accelerator.prepare(policy, ...)`.
-    # Otherwise the optimizer can hold references to pre-FSDP parameters and silently stop updating.
+    # Important:
+    # - Use `accelerator.prepare(...)` for model/optimizer (FSDP wrapping, DDP sync, etc.)
+    # - Do NOT pass dataloaders into `accelerator.prepare(...)` here since we already construct
+    #   a `DistributedSampler` in `build_train_val(...)` for multi-process runs; double-sharding
+    #   can otherwise change the effective sample stream.
     if fsdp_enabled and fsdp_shard_ref_model:
-        policy, ref_model, train_loader, val_loader = accelerator.prepare(policy, ref_model, train_loader, val_loader)
+        policy, ref_model = accelerator.prepare(policy, ref_model)
         ref_model.requires_grad_(False)
     else:
-        policy, train_loader, val_loader = accelerator.prepare(policy, train_loader, val_loader)
-    if accelerator.is_main_process:
-        logger.info("dataloader types: train=%s val=%s", type(train_loader).__name__, type(val_loader).__name__)
-        if accelerator.num_processes > 1 and getattr(accelerator, "split_batches", False):
-            logger.warning(
-                "accelerate split_batches=True => per-rank batch is smaller and global batch may stay constant; "
-                "this often makes multi-GPU slower for small batches. Consider `accelerate.split_batches: false`."
-            )
+        policy = accelerator.prepare(policy)
+
     optimizer = AdamW(params=policy.parameters(), lr=float(config['dpo_training']['learning_rate']))
     optimizer = accelerator.prepare(optimizer)
     if not (fsdp_enabled and fsdp_shard_ref_model):
         ref_model.to(device)
+
+    if accelerator.is_main_process:
+        logger.info("dataloader types: train=%s val=%s", type(train_loader).__name__, type(val_loader).__name__)
+
+        def _sampler_name(dl):
+            sampler_candidates = []
+            sampler_candidates.append(getattr(dl, "sampler", None))
+            sampler_candidates.append(getattr(getattr(dl, "batch_sampler", None), "sampler", None))
+            for s in sampler_candidates:
+                if s is not None:
+                    return type(s).__name__
+            return None
+
+        logger.info("samplers: train=%s val=%s", _sampler_name(train_loader), _sampler_name(val_loader))
+        per_rank_bs = int(config['dpo_training']['batch_size'])
+        logger.info("expected global batch size=%s", per_rank_bs * accelerator.num_processes)
 
     policy.train()
     ref_model.eval()
@@ -339,6 +383,18 @@ def train(config_path: str, mode: str = "dynamic"):
             debug_param = None
 
     for epoch in range(epochs):
+        # Ensure DistributedSampler is reshuffled deterministically across ranks each epoch (if present).
+        sampler_candidates = []
+        sampler_candidates.append(getattr(train_loader, "sampler", None))
+        sampler_candidates.append(getattr(getattr(train_loader, "batch_sampler", None), "sampler", None))
+        if hasattr(train_loader, "dataloader"):
+            sampler_candidates.append(getattr(train_loader.dataloader, "sampler", None))
+            sampler_candidates.append(getattr(getattr(train_loader.dataloader, "batch_sampler", None), "sampler", None))
+        for sampler in sampler_candidates:
+            if sampler is not None and hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch)
+                break
+
         epoch_dir = os.path.join(LOG_DIR, f"epoch_{epoch:03d}")
         if accelerator.is_main_process:
             os.makedirs(epoch_dir, exist_ok=True)
@@ -587,13 +643,42 @@ def train(config_path: str, mode: str = "dynamic"):
     if is_dynamic and log_f is not None:
         log_f.close()
 
-# Save final model, rank 0 only, gather full state dict
+    # Save final model: mirror `archive/dynamic_beta/training-fsdp.py`
+    # - Gather FULL_STATE_DICT
+    # - Offload to CPU
+    # - Save weights as fp32 (load into a fresh fp32 base model)
     save_dir = config['dpo_training'].get('save_dir', 'dpo_model')
     accelerator.wait_for_everyone()
+
+    cpu_state = None
+    if fsdp_enabled and isinstance(policy, FSDP):
+        full_state_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        full_optim_cfg = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(
+            policy,
+            StateDictType.FULL_STATE_DICT,
+            full_state_cfg,
+            full_optim_cfg,
+        ):
+            cpu_state = policy.state_dict()
+    else:
+        # Non-FSDP: only rank0 needs the full model weights; move to CPU for saving.
+        if accelerator.is_main_process:
+            state = accelerator.unwrap_model(policy).state_dict()
+            cpu_state = {k: (v.detach().cpu() if torch.is_tensor(v) else v) for k, v in state.items()}
+
     if accelerator.is_main_process:
-        unwrapped_policy = accelerator.unwrap_model(policy)
-        state_dict = accelerator.get_state_dict(policy)
-        unwrapped_policy.save_pretrained(save_dir, state_dict=state_dict)
+        os.makedirs(save_dir, exist_ok=True)
+        base_model = AutoModelForCausalLM.from_pretrained(
+            policy_name,
+            torch_dtype=torch.float32,
+        )
+        base_model.load_state_dict(cpu_state, strict=False)
+        base_model.save_pretrained(save_dir)
+        tok.save_pretrained(save_dir)
+        logger.info("[SAVE] saved fp32 model to: %s", save_dir)
+
+    accelerator.wait_for_everyone()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
