@@ -17,3 +17,19 @@ dependencies = [
     "trl>=0.26.2",
     "wandb>=0.23.1",
 ]
+
+[project.scripts]
+training.py = "training:train"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = [
+    "batch_log_prob",
+    "dataset_process_hh",
+    "dpo_loss",
+    "mean_and_var",
+    "training",
+]

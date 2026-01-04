@@ -9,3 +9,6 @@ logs/
 dpo_model/
 dynamic_dpo_model/
 .venv/
+hf_*/
+cache/
+archive/
